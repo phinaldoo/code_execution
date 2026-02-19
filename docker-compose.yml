@@ -1,0 +1,60 @@
+# ============================================================
+# Code Execution Service — Docker Compose
+# ============================================================
+# Usage:
+#   docker compose build    # Build all images
+#   docker compose up -d    # Start the gateway
+#   docker compose logs -f  # View logs
+#   docker compose down     # Stop everything
+# ============================================================
+
+services:
+  # --- API Gateway ---
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: code-execution-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    volumes:
+      # Docker socket — required for the gateway to manage sandbox containers
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Seccomp profile for sandbox containers
+      - ./security/seccomp-profile.json:/etc/code-execution/seccomp-profile.json:ro
+    environment:
+      - SANDBOX_IMAGE=${SANDBOX_IMAGE:-code-sandbox:latest}
+      - MAX_CONCURRENT_EXECUTIONS=${MAX_CONCURRENT_EXECUTIONS:-10}
+      - DEFAULT_TIMEOUT=${DEFAULT_TIMEOUT:-30}
+      - MAX_TIMEOUT=${MAX_TIMEOUT:-120}
+      - SANDBOX_MEM_LIMIT=${SANDBOX_MEM_LIMIT:-512m}
+      - SANDBOX_CPU_PERIOD=${SANDBOX_CPU_PERIOD:-100000}
+      - SANDBOX_CPU_QUOTA=${SANDBOX_CPU_QUOTA:-100000}
+      - SANDBOX_PIDS_LIMIT=${SANDBOX_PIDS_LIMIT:-64}
+      - SANDBOX_TMPFS_SIZE=${SANDBOX_TMPFS_SIZE:-100m}
+      - SANDBOX_NETWORK_MODE=${SANDBOX_NETWORK_MODE:-bridge}
+      - SECCOMP_PROFILE_PATH=/etc/code-execution/seccomp-profile.json
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --- Sandbox Image Builder ---
+  # This service only builds the sandbox image; it doesn't run.
+  sandbox:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    image: code-sandbox:latest
+    entrypoint: [ "echo", "Sandbox image built successfully" ]
+    profiles:
+      - build
