@@ -201,10 +201,52 @@ def execute_code(code: str) -> dict:
     }
 
 
+def install_pip_packages():
+    """Install packages specified in PIP_PACKAGES environment variable."""
+    packages_str = os.environ.get("PIP_PACKAGES", "").strip()
+    if not packages_str:
+        return None, None
+
+    packages = [p.strip() for p in packages_str.split(",") if p.strip()]
+    if not packages:
+        return None, None
+
+    import subprocess
+    import importlib
+    start_install = time.monotonic()
+    try:
+        # Install to user directory to avoid permission issues
+        # --no-cache-dir to keep it clean and fast
+        cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", "--quiet"] + packages
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        install_time = round(time.monotonic() - start_install, 2)
+        
+        # Invalidate caches so new packages are found
+        importlib.invalidate_caches()
+        
+        if result.returncode != 0:
+            error_msg = f"Pip install failed with code {result.returncode}:\n{result.stderr or result.stdout}"
+            return error_msg, install_time
+            
+        return None, install_time
+    except Exception as e:
+        return f"Pip install exception: {str(e)}", round(time.monotonic() - start_install, 2)
+
+
 def main():
     """Main entry point for the executor."""
     setup_output_dir()
     patch_matplotlib()
+
+    # Dynamic package installation
+    install_error, install_time = install_pip_packages()
+
+    # Ensure user site-packages are in sys.path
+    import site
+    user_site = site.getusersitepackages()
+    if user_site not in sys.path:
+        sys.path.append(user_site)
 
     # Read code from base64-encoded environment variable (preferred)
     # or fall back to file-based loading
@@ -252,6 +294,18 @@ def main():
 
     # Execute the code
     result = execute_code(code)
+
+    # Add install info if any
+    if install_time:
+        result["install_time"] = install_time
+    
+    if install_error:
+        # If install failed, we still try to run (maybe packages were already there?)
+        # but we prepend the error to stderr
+        result["stderr"] = f"--- PIP INSTALL ERROR ---\n{install_error}\n------------------------\n" + result["stderr"]
+        if not result["error"]:
+            result["error"] = "Pip installation failed"
+            result["error_type"] = "InstallationError"
 
     # Output as JSON — stdout was captured, so real stdout is clean
     print(json.dumps(result))

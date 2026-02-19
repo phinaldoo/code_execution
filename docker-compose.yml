@@ -36,6 +36,7 @@ services:
       - SANDBOX_NETWORK_MODE=${SANDBOX_NETWORK_MODE:-bridge}
       - SECCOMP_PROFILE_PATH=/etc/code-execution/seccomp-profile.json
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - API_KEY=${API_KEY}
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
       interval: 30s

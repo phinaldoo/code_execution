@@ -24,9 +24,10 @@ from typing import Optional
 
 import docker
 import docker.errors
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 # --- Configuration via Environment Variables ---
@@ -42,6 +43,7 @@ SANDBOX_TMPFS_SIZE = os.getenv("SANDBOX_TMPFS_SIZE", "100m")
 SANDBOX_NETWORK_MODE = os.getenv("SANDBOX_NETWORK_MODE", "bridge")  # "bridge" or "none"
 SECCOMP_PROFILE_PATH = os.getenv("SECCOMP_PROFILE_PATH", "/etc/code-execution/seccomp-profile.json")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+API_KEY = os.getenv("API_KEY")  # Optional Bearer token protection
 
 # --- Logging ---
 logging.basicConfig(
@@ -116,6 +118,23 @@ app.add_middleware(
 )
 
 
+# --- Security ---
+security = HTTPBearer(auto_error=False)
+
+async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    """Verify the Bearer token if API_KEY is set."""
+    if not API_KEY:
+        return True
+    
+    if not credentials or credentials.credentials != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return True
+
+
 # --- Request/Response Models ---
 class ExecuteRequest(BaseModel):
     """Request body for code execution."""
@@ -129,6 +148,10 @@ class ExecuteRequest(BaseModel):
     enable_network: Optional[bool] = Field(
         default=True,
         description="Whether to enable network access in the sandbox",
+    )
+    pip_packages: Optional[list[str]] = Field(
+        default_factory=list,
+        description="Optional list of pip packages to install before execution",
     )
 
 
@@ -159,6 +182,7 @@ async def run_code_in_sandbox(
     timeout: int,
     enable_network: bool,
     execution_id: str,
+    pip_packages: Optional[list[str]] = None,
 ) -> ExecuteResponse:
     """
     Create an ephemeral sandbox container, run the code, and collect results.
@@ -198,6 +222,7 @@ async def run_code_in_sandbox(
             "PYTHONUNBUFFERED": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
+            "PIP_PACKAGES": ",".join(pip_packages) if pip_packages else "",
         },
         "cap_drop": ["ALL"],
         "labels": {
@@ -367,7 +392,7 @@ async def run_code_in_sandbox(
 # --- API Endpoints ---
 
 @app.post("/execute", response_model=ExecuteResponse)
-async def execute_code(request: ExecuteRequest):
+async def execute_code(request: ExecuteRequest, _auth: bool = Depends(verify_api_key)):
     """
     Execute Python code in a secure, isolated sandbox container.
 
@@ -408,6 +433,7 @@ async def execute_code(request: ExecuteRequest):
                 timeout=timeout,
                 enable_network=request.enable_network,
                 execution_id=execution_id,
+                pip_packages=request.pip_packages,
             )
 
             if result.timed_out:

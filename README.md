@@ -15,6 +15,7 @@ docker compose up -d
 # 3. Test it
 curl -X POST http://localhost:8000/execute \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your-key-if-set>" \
   -d '{"code": "print(\"Hello from sandbox!\")"}'
 
 # 4. Run full test suite
@@ -32,8 +33,14 @@ Execute Python code in a sandbox container.
 {
   "code": "import matplotlib.pyplot as plt\nplt.plot([1,2,3])\nplt.show()",
   "timeout": 30,
-  "enable_network": true
+  "enable_network": true,
+  "pip_packages": ["cowsay", "yfinance"]
 }
+```
+
+**Authentication:**
+If `API_KEY` is configured in the environment, all requests must include:
+`Authorization: Bearer <API_KEY>`
 ```
 
 **Response:**
@@ -103,10 +110,15 @@ Copy `.env.example` to `.env` and adjust:
 | `SANDBOX_MEM_LIMIT` | 512m | Memory limit per container |
 | `SANDBOX_CPU_QUOTA` | 100000 | CPU quota (100000 = 1 core) |
 | `SANDBOX_NETWORK_MODE` | bridge | `bridge` (internet) or `none` |
+| `API_KEY` | (none) | Optional Bearer token for API protection |
 
-## Pre-installed Packages
+## Packages
 
+### Pre-installed
 numpy, pandas, matplotlib, seaborn, scipy, scikit-learn, sympy, Pillow, requests, openpyxl, pyyaml
+
+### Dynamic Installation
+You can install additional packages per request by adding them to the `pip_packages` list in the request body. These are installed into the ephemeral sandbox and cleared after execution.
 
 ## Scaling
 
