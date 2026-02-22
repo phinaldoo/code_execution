@@ -10,12 +10,15 @@ This script runs inside the sandbox container. It:
 5. Returns a structured JSON response with results + base64-encoded files
 """
 
+import argparse
 import base64
 import io
 import json
 import mimetypes
 import os
 import signal
+import subprocess
+import shutil
 import sys
 import time
 import traceback
@@ -33,6 +36,17 @@ MAX_TOTAL_FILES_SIZE = 100 * 1024 * 1024  # 100MB total
 def setup_output_dir():
     """Ensure the output directory exists and is clean."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def clear_output_dir():
+    """Clear all contents of the output directory after execution."""
+    if not OUTPUT_DIR.exists():
+        return
+    for item in OUTPUT_DIR.iterdir():
+        if item.is_file() or item.is_symlink():
+            item.unlink()
+        elif item.is_dir():
+            shutil.rmtree(item)
 
 
 def patch_matplotlib():
@@ -201,6 +215,66 @@ def execute_code(code: str) -> dict:
     }
 
 
+def execute_bash(code: str) -> dict:
+    """
+    Execute the given Bash code and capture results.
+    """
+    start_time = time.monotonic()
+    error = None
+    error_type = None
+
+    # Write code to a temporary script file inside the tmpfs mount
+    script_path = Path("/tmp/misc/script.sh")
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(code, encoding="utf-8")
+    script_path.chmod(0o755)
+
+    try:
+        # Run the script
+        result = subprocess.run(
+            ["/bin/bash", str(script_path)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        
+        stdout_text = result.stdout
+        stderr_text = result.stderr
+        
+        if result.returncode != 0:
+            error = f"Bash script exited with code {result.returncode}"
+            error_type = "BashExitError"
+
+    except subprocess.TimeoutExpired as e:
+        error = "Bash execution timed out"
+        error_type = "TimeoutError"
+        stdout_text = e.stdout.decode() if e.stdout else ""
+        stderr_text = e.stderr.decode() if e.stderr else ""
+    except Exception as e:
+        error = f"Bash execution failed: {str(e)}"
+        error_type = type(e).__name__
+        stdout_text = ""
+        stderr_text = ""
+    finally:
+        # Cleanup script
+        if script_path.exists():
+            script_path.unlink()
+
+    execution_time = round(time.monotonic() - start_time, 4)
+
+    # Collect any generated files
+    files = collect_output_files()
+
+    return {
+        "stdout": truncate_output(stdout_text),
+        "stderr": truncate_output(stderr_text),
+        "error": error,
+        "error_type": error_type,
+        "files": files,
+        "execution_time": execution_time,
+    }
+
+
 def install_pip_packages():
     """Install packages specified in PIP_PACKAGES environment variable."""
     packages_str = os.environ.get("PIP_PACKAGES", "").strip()
@@ -236,20 +310,27 @@ def install_pip_packages():
 
 def main():
     """Main entry point for the executor."""
+    parser = argparse.ArgumentParser(description="Code Executor")
+    parser.add_argument("--lang", type=str, choices=["python", "bash"], default="python", help="Language to execute")
+    args = parser.parse_args()
+
     setup_output_dir()
-    patch_matplotlib()
 
-    # Dynamic package installation
-    install_error, install_time = install_pip_packages()
+    if args.lang == "python":
+        patch_matplotlib()
 
-    # Ensure user site-packages are in sys.path
-    import site
-    user_site = site.getusersitepackages()
-    if user_site not in sys.path:
-        sys.path.append(user_site)
+        # Dynamic package installation
+        install_error, install_time = install_pip_packages()
 
-    # Read code from base64-encoded environment variable (preferred)
-    # or fall back to file-based loading
+        # Ensure user site-packages are in sys.path
+        import site
+        user_site = site.getusersitepackages()
+        if user_site not in sys.path:
+            sys.path.append(user_site)
+    else:
+        install_error, install_time = None, None
+
+    # Read code from base64-encoded environment variable
     code_b64 = os.environ.get("CODE_B64", "")
     
     if code_b64:
@@ -266,14 +347,12 @@ def main():
             }
             print(json.dumps(result))
             sys.exit(1)
-    elif CODE_PATH.exists():
-        code = CODE_PATH.read_text(encoding="utf-8")
     else:
         result = {
             "stdout": "",
             "stderr": "",
-            "error": "No code provided (set CODE_B64 env var or mount code at /tmp/code/main.py)",
-            "error_type": "FileNotFoundError",
+            "error": "No code provided (set CODE_B64 env var)",
+            "error_type": "ValueError",
             "files": [],
             "execution_time": 0,
         }
@@ -293,19 +372,24 @@ def main():
         sys.exit(1)
 
     # Execute the code
-    result = execute_code(code)
+    if args.lang == "python":
+        result = execute_code(code)
+    elif args.lang == "bash":
+        result = execute_bash(code)
 
-    # Add install info if any
+    # Add install info if any for python
     if install_time:
         result["install_time"] = install_time
     
     if install_error:
-        # If install failed, we still try to run (maybe packages were already there?)
-        # but we prepend the error to stderr
+        # If install failed, we prepend the error to stderr
         result["stderr"] = f"--- PIP INSTALL ERROR ---\n{install_error}\n------------------------\n" + result["stderr"]
         if not result["error"]:
             result["error"] = "Pip installation failed"
             result["error_type"] = "InstallationError"
+
+    # Clean up output directory after collecting files
+    clear_output_dir()
 
     # Output as JSON — stdout was captured, so real stdout is clean
     print(json.dumps(result))

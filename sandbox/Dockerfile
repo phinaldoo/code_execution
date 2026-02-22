@@ -49,6 +49,7 @@ ENV MPLBACKEND=Agg \
 
 # --- Runtime ---
 USER sandbox
-WORKDIR /tmp/code
+WORKDIR /home/sandbox
 
-ENTRYPOINT ["python", "/usr/local/bin/executor.py"]
+# Start bash and sleep indefinitely to keep the container running
+CMD ["sleep", "infinity"]

@@ -1,136 +1,123 @@
-# Code Execution Service
+# Code Execution Service (Mini-VM)
 
-A secure, scalable Docker-based service for executing Python code from LLM models. Each execution runs in an isolated, ephemeral container with strict security controls.
+A secure, scalable Docker-based service for executing code in persistent "mini-VM" sessions. This version introduces stateful container sessions that survive between multiple execution calls, supporting both Python and Bash with advanced file management.
 
 ## Quick Start
 
 ```bash
-# 1. Build both images
+# 1. Build images
 docker compose build
-docker compose build --profile build   # builds sandbox image
 
 # 2. Start the gateway
 docker compose up -d
 
-# 3. Test it
+# 3. Create a container session
+curl -X POST http://localhost:8000/containers -d '{}'
+# Returns: {"container_id": "...", "status": "active", ...}
+
+# 4. Execute code in that session
 curl -X POST http://localhost:8000/execute \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-key-if-set>" \
-  -d '{"code": "print(\"Hello from sandbox!\")"}'
+  -d '{
+    "container_id": "YOUR_CONTAINER_ID",
+    "language": "python",
+    "code": "with open(\"data.txt\", \"w\") as f: f.write(\"Hello VM!\")"
+  }'
 
-# 4. Run full test suite
-python3 test_execution.py
+# 5. Verify persistence in Bash
+curl -X POST http://localhost:8000/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "container_id": "YOUR_CONTAINER_ID",
+    "language": "bash",
+    "code": "cat data.txt"
+  }'
 ```
 
-## API
+## Key Features
+
+- **Stateful Sessions**: Containers stay alive for **20 minutes after the latest activity**. Subsequent requests to the same `container_id` share the same filesystem (`/home/sandbox`).
+- **Multi-language**: Native support for **Python** and **Bash**.
+- **File Injection**: Upload input files directly to the VM session in the `/execute` request.
+- **Auto-Retrieval**: Any files written to `/tmp/output/` are automatically returned as base64-encoded strings in the API response and cleared from the container.
+- **Highly Secure**: Strict resource limits, non-root users, and isolated execution via `exec_run`.
+
+## API Reference
+
+### `POST /containers`
+Create a new long-running container session.
+- **Body**: `{"enable_network": true}`
+- **Response**: Returns `container_id`.
+
+### `GET /containers/{id}`
+Check session status, uptime, and last activity.
+
+### `DELETE /containers/{id}`
+Manually terminate and remove a container session.
 
 ### `POST /execute`
+Execute code inside an active session.
 
-Execute Python code in a sandbox container.
-
-**Request:**
+**Request Body:**
 ```json
 {
-  "code": "import matplotlib.pyplot as plt\nplt.plot([1,2,3])\nplt.show()",
+  "container_id": "string",
+  "language": "python" | "bash",
+  "code": "string",
   "timeout": 30,
-  "enable_network": true,
-  "pip_packages": ["cowsay", "yfinance"]
+  "pip_packages": ["list", "of", "packages"],
+  "files": [
+    {
+      "name": "input.json",
+      "content": "<base64_encoded_content>"
+    }
+  ]
 }
 ```
 
-**Authentication:**
-If `API_KEY` is configured in the environment, all requests must include:
-`Authorization: Bearer <API_KEY>`
-```
-
-**Response:**
+**Response Body:**
 ```json
 {
-  "execution_id": "a1b2c3d4e5f6",
-  "stdout": "",
-  "stderr": "",
-  "error": null,
-  "error_type": null,
+  "execution_id": "string",
+  "stdout": "string",
+  "stderr": "string",
+  "error": "string | null",
   "files": [
     {
-      "name": "figure_1.png",
-      "content": "<base64-encoded PNG>",
+      "name": "result.png",
+      "content": "<base64_encoded_content>",
       "mime_type": "image/png",
-      "size": 45231
+      "size": 1234
     }
   ],
-  "execution_time": 1.234,
+  "execution_time": 0.45,
   "timed_out": false
 }
 ```
 
-### `GET /health`
+## Security & Isolation
 
-Health check — returns service status, Docker connectivity, and metrics.
-
-### `GET /metrics`
-
-Execution metrics — total, successful, failed, timed out, active counts.
-
-## Architecture
-
-```
-LLM → POST /execute → [Gateway] → creates → [Sandbox Container]
-                                                 ↓
-                                            Runs Python code
-                                                 ↓
-                                       Returns JSON + base64 files
-                                                 ↓
-                                     Container auto-destroyed
-```
-
-- **Gateway**: Persistent FastAPI service managing sandbox lifecycle
-- **Sandbox**: Ephemeral Python container, destroyed after each execution
-
-## Security
-
-| Layer | Measure |
+| Feature | Implementation |
 |---|---|
-| Container | Ephemeral, auto-removed |
-| User | Non-root `sandbox` user |
-| Filesystem | Read-only + size-limited tmpfs |
-| Resources | 512MB RAM, 1 CPU, 64 PIDs |
-| Syscalls | Custom seccomp profile |
-| Capabilities | All dropped |
-| Timeout | Configurable hard kill |
+| **Session Lifecycle** | 20-min inactivity timeout (auto-cleanup) |
+| **Isolation** | Shared-kernel container isolation |
+| **User** | Non-root `sandbox` user |
+| **Resource Limits** | 512MB RAM, 1 CPU, 64 PIDs |
+| **Filesystem** | Persistent `/home/sandbox`, Ephemeral `/tmp/output` |
+| **Network** | Configurable per container session |
+
+## Advanced Usage
+
+### File Outputs
+Any file you want returned by the API must be saved to `/tmp/output/`.
+- In Python: `plt.savefig('/tmp/output/plot.png')` (or just `plt.show()` which is auto-patched).
+- In Bash: `echo "Done" > /tmp/output/status.txt`.
+
+### Input Files
+You can seed your VM session with files by providing them in the `files` array of the `/execute` request. They will be placed in the current working directory (`/home/sandbox`).
 
 ## Configuration
-
-Copy `.env.example` to `.env` and adjust:
-
-| Variable | Default | Description |
-|---|---|---|
-| `MAX_CONCURRENT_EXECUTIONS` | 10 | Max parallel sandbox containers |
-| `DEFAULT_TIMEOUT` | 30 | Default execution timeout (seconds) |
-| `SANDBOX_MEM_LIMIT` | 512m | Memory limit per container |
-| `SANDBOX_CPU_QUOTA` | 100000 | CPU quota (100000 = 1 core) |
-| `SANDBOX_NETWORK_MODE` | bridge | `bridge` (internet) or `none` |
-| `API_KEY` | (none) | Optional Bearer token for API protection |
-
-## Packages
-
-### Pre-installed
-numpy, pandas, matplotlib, seaborn, scipy, scikit-learn, sympy, Pillow, requests, openpyxl, pyyaml
-
-### Dynamic Installation
-You can install additional packages per request by adding them to the `pip_packages` list in the request body. These are installed into the ephemeral sandbox and cleared after execution.
-
-## Scaling
-
-- Run multiple gateway instances behind a load balancer
-- Each gateway manages its own sandbox pool
-- Gateway is fully stateless
-- Sandbox images are cached — container spin-up is ~200ms
-
-## File Output
-
-Code can generate files by:
-1. Using `plt.show()` — automatically saved as PNG
-2. Writing files to `/tmp/output/` — returned as base64
-
-All output files are included in the response as base64-encoded content with MIME type detection.
+Configuration is managed via environment variables in `docker-compose.yml` or a `.env` file.
+- `SESSION_TIMEOUT_SECONDS`: Default 1200 (20 minutes).
+- `SANDBOX_MEM_LIMIT`: Memory allocated per VM.
+- `API_KEY`: Set to enable Bearer token authentication.
