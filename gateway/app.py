@@ -13,14 +13,18 @@ capabilities, read-only filesystem, custom seccomp profile, and non-root user.
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import os
+import re
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Deque, Dict, List, NamedTuple, Optional
 
 import docker
 import docker.errors
@@ -28,7 +32,14 @@ from fastapi import FastAPI, HTTPException, Request, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
+
+# --- Helper Utilities ---
+def str_to_bool(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 # --- Configuration via Environment Variables ---
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "code-sandbox:latest")
@@ -44,6 +55,16 @@ SANDBOX_NETWORK_MODE = os.getenv("SANDBOX_NETWORK_MODE", "bridge")  # "bridge" o
 SECCOMP_PROFILE_PATH = os.getenv("SECCOMP_PROFILE_PATH", "/etc/code-execution/seccomp-profile.json")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 API_KEY = os.getenv("API_KEY")  # Optional Bearer token protection
+MAX_INPUT_FILES = int(os.getenv("MAX_INPUT_FILES", "10"))
+MAX_INPUT_FILE_SIZE = int(os.getenv("MAX_INPUT_FILE_SIZE", str(5 * 1024 * 1024)))
+MAX_INPUT_TOTAL_SIZE = int(os.getenv("MAX_INPUT_TOTAL_SIZE", str(20 * 1024 * 1024)))
+MAX_FILE_NAME_LENGTH = int(os.getenv("MAX_FILE_NAME_LENGTH", "128"))
+MAX_PIP_PACKAGES = int(os.getenv("MAX_PIP_PACKAGES", "5"))
+MAX_PIP_PACKAGE_NAME_LENGTH = int(os.getenv("MAX_PIP_PACKAGE_NAME_LENGTH", "64"))
+ALLOW_PIP_INSTALLS = str_to_bool(os.getenv("ALLOW_PIP_INSTALLS", "true"))
+PIP_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*([\[,\]A-Za-z0-9._-]*)?(([!=<>~]=?|>=?|<=?)[\w.*]+([,;]([!=<>~]=?|>=?|<=?)[\w.*]+)*)?$")
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS_PER_WINDOW", "30"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 # --- Logging ---
 logging.basicConfig(
@@ -60,9 +81,67 @@ execution_semaphore: asyncio.Semaphore
 docker_client: docker.DockerClient
 
 # --- Session Management ---
-# Map of container_id -> last_activity_timestamp
-active_sessions: Dict[str, float] = {}
+
+
+@dataclass
+class SessionInfo:
+    last_activity: float
+    network_enabled: bool
+
+
+class PreparedFile(NamedTuple):
+    name: str
+    content: bytes
+
+
+# Map of container_id -> SessionInfo
+active_sessions: Dict[str, SessionInfo] = {}
 SESSION_TIMEOUT_SECONDS = 20 * 60  # 20 minutes
+
+# Rate limiting state
+rate_limit_state: Dict[str, Deque[float]] = {}
+rate_limit_lock: asyncio.Lock
+
+
+def infer_network_enabled(container: docker.models.containers.Container) -> bool:
+    try:
+        host_cfg = container.attrs.get("HostConfig", {})
+        network_mode = host_cfg.get("NetworkMode", SANDBOX_NETWORK_MODE)
+        return network_mode != "none"
+    except Exception:
+        return SANDBOX_NETWORK_MODE != "none"
+
+
+def touch_session(container_id: str):
+    session = active_sessions.get(container_id)
+    if session:
+        session.last_activity = time.time()
+
+
+async def check_rate_limit(key: str):
+    if RATE_LIMIT_REQUESTS <= 0:
+        return
+    if not key:
+        return
+
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW_SECONDS
+
+    async with rate_limit_lock:
+        hits = rate_limit_state.setdefault(key, deque())
+        while hits and hits[0] < window_start:
+            hits.popleft()
+
+        if len(hits) >= RATE_LIMIT_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Rate limit exceeded for this container. "
+                    "Please slow down or request higher limits."
+                ),
+            )
+
+        hits.append(now)
 
 
 async def cleanup_idle_containers():
@@ -71,8 +150,8 @@ async def cleanup_idle_containers():
         try:
             now = time.time()
             idle_ids = [
-                cid for cid, last_activity in active_sessions.items()
-                if now - last_activity > SESSION_TIMEOUT_SECONDS
+                cid for cid, session in active_sessions.items()
+                if now - session.last_activity > SESSION_TIMEOUT_SECONDS
             ]
 
             for cid in idle_ids:
@@ -120,10 +199,11 @@ metrics = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize Docker client and semaphore on startup."""
-    global docker_client, execution_semaphore
+    global docker_client, execution_semaphore, rate_limit_lock
 
     docker_client = docker.from_env()
     execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    rate_limit_lock = asyncio.Lock()
 
     # Verify sandbox image exists
     try:
@@ -148,8 +228,14 @@ async def lifespan(app: FastAPI):
             filters={"label": "managed-by=code-execution-gateway"}
         )
         for c in managed_containers:
-            active_sessions[c.id] = time.time()
-            logger.info(f"Recovered tracking for container {c.id}")
+            active_sessions[c.id] = SessionInfo(
+                last_activity=time.time(),
+                network_enabled=infer_network_enabled(c),
+            )
+            logger.info(
+                f"Recovered tracking for container {c.id} "
+                f"(network={'on' if active_sessions[c.id].network_enabled else 'off'})"
+            )
     except Exception as e:
         logger.warning(f"Failed to recover existing containers: {e}")
 
@@ -202,6 +288,19 @@ class FileInput(BaseModel):
     name: str = Field(..., description="File name including extension")
     content: str = Field(..., description="Base64 encoded content of the file")
 
+    @validator("name")
+    def validate_name(cls, value: str) -> str:
+        sanitized = value.strip()
+        if not sanitized:
+            raise ValueError("File name cannot be empty")
+        if len(sanitized) > MAX_FILE_NAME_LENGTH:
+            raise ValueError(f"File name too long (max {MAX_FILE_NAME_LENGTH} chars)")
+        if ".." in sanitized or sanitized.startswith(('/', '\\')):
+            raise ValueError("File name contains invalid path segments")
+        if any(part in {"", ".", ".."} for part in sanitized.split('/')):
+            raise ValueError("File name contains invalid components")
+        return sanitized
+
 
 class ExecuteRequest(BaseModel):
     """Request body for code execution."""
@@ -226,6 +325,31 @@ class ExecuteRequest(BaseModel):
         default_factory=list,
         description="Input files to copy to the container before executing",
     )
+
+    @validator("pip_packages", each_item=True)
+    def validate_pip_package(cls, pkg: str) -> str:
+        name = pkg.strip()
+        if not name:
+            raise ValueError("Package name cannot be empty")
+        if len(name) > MAX_PIP_PACKAGE_NAME_LENGTH:
+            raise ValueError(f"Package name too long (max {MAX_PIP_PACKAGE_NAME_LENGTH} chars)")
+        if not PIP_PACKAGE_PATTERN.match(name):
+            raise ValueError("Package name contains invalid characters")
+        return name
+
+    @validator("pip_packages")
+    def validate_pip_package_list(cls, packages: list[str]) -> list[str]:
+        if not ALLOW_PIP_INSTALLS and packages:
+            raise ValueError("Pip installations are disabled")
+        if len(packages) > MAX_PIP_PACKAGES:
+            raise ValueError(f"Too many pip packages (max {MAX_PIP_PACKAGES})")
+        return packages
+
+    @validator("files")
+    def validate_file_count(cls, files: list[FileInput]) -> list[FileInput]:
+        if len(files) > MAX_INPUT_FILES:
+            raise ValueError(f"Too many input files (max {MAX_INPUT_FILES})")
+        return files
 
 
 class ContainerResponse(BaseModel):
@@ -302,12 +426,15 @@ async def create_container_session(enable_network: bool = True) -> str:
         None,
         lambda: docker_client.containers.run(detach=True, **container_config),
     )
-    
-    active_sessions[container.id] = time.time()
+
+    active_sessions[container.id] = SessionInfo(
+        last_activity=time.time(),
+        network_enabled=enable_network,
+    )
     return container.id
 
 
-def create_tar_archive_from_files(files: list[FileInput]) -> bytes:
+def create_tar_archive_from_files(files: list[PreparedFile]) -> bytes:
     """Create a tar archive in memory containing the given files."""
     import tarfile
     from io import BytesIO
@@ -315,14 +442,48 @@ def create_tar_archive_from_files(files: list[FileInput]) -> bytes:
     tar_stream = BytesIO()
     with tarfile.open(fileobj=tar_stream, mode='w') as tar:
         for file in files:
-            content_bytes = base64.b64decode(file.content)
             info = tarfile.TarInfo(name=file.name)
-            info.size = len(content_bytes)
+            info.size = len(file.content)
             # Give proper permissions
             info.mode = 0o666
-            tar.addfile(tarinfo=info, fileobj=BytesIO(content_bytes))
+            tar.addfile(tarinfo=info, fileobj=BytesIO(file.content))
     
     return tar_stream.getvalue()
+
+
+def prepare_files(files: list[FileInput]) -> list[PreparedFile]:
+    prepared: list[PreparedFile] = []
+    total_size = 0
+
+    for file in files:
+        try:
+            content_bytes = base64.b64decode(file.content)
+        except binascii.Error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{file.name}' content is not valid base64",
+            )
+
+        file_size = len(content_bytes)
+        if file_size > MAX_INPUT_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"File '{file.name}' too large ({file_size} bytes, "
+                    f"max {MAX_INPUT_FILE_SIZE})"
+                ),
+            )
+
+        total_size += file_size
+        if total_size > MAX_INPUT_TOTAL_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail="Total size of uploaded files exceeds limit",
+            )
+
+        prepared.append(PreparedFile(name=file.name, content=content_bytes))
+
+    return prepared
 
 
 async def run_code_in_sandbox(
@@ -339,8 +500,9 @@ async def run_code_in_sandbox(
     """
     loop = asyncio.get_event_loop()
 
-    if container_id not in active_sessions:
-         raise HTTPException(status_code=404, detail="Container session not found, or it was shut down due to inactivity.")
+    session = active_sessions.get(container_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Container session not found, or it was shut down due to inactivity.")
 
     try:
         container = await loop.run_in_executor(
@@ -358,10 +520,12 @@ async def run_code_in_sandbox(
     # Base64-encode the code for safe env var transport
     code_b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
 
+    prepared_files = prepare_files(files) if files else []
+
     # Upload files if any
-    if files:
+    if prepared_files:
         try:
-            tar_data = create_tar_archive_from_files(files)
+            tar_data = create_tar_archive_from_files(prepared_files)
             await loop.run_in_executor(
                 None,
                 lambda: container.put_archive("/home/sandbox", tar_data)
@@ -382,6 +546,7 @@ async def run_code_in_sandbox(
     environment = {
         "CODE_B64": code_b64,
         "PIP_PACKAGES": ",".join(pip_packages) if pip_packages else "",
+        "ENABLE_NETWORK": "1" if session.network_enabled else "0",
     }
 
     timed_out = False
@@ -462,7 +627,7 @@ async def run_code_in_sandbox(
 
             # Re-update activity because execution could have taken a while
             if container_id in active_sessions:
-                active_sessions[container_id] = time.time()
+                touch_session(container_id)
 
             return ExecuteResponse(
                 execution_id=execution_id,
@@ -517,7 +682,7 @@ async def create_container(request: CreateContainerRequest = None, _auth: bool =
             container_id=container_id,
             status="active",
             uptime_seconds=0.0,
-            last_activity=active_sessions[container_id]
+            last_activity=active_sessions[container_id].last_activity
         )
     except Exception as e:
         logger.error(f"Failed to create container: {e}")
@@ -532,11 +697,12 @@ async def get_container(container_id: str, _auth: bool = Depends(verify_api_key)
     try:
          docker_client.containers.get(container_id)
          now = time.time()
+         session = active_sessions[container_id]
          return ContainerResponse(
              container_id=container_id,
              status="active",
-             uptime_seconds=now - active_sessions[container_id],
-             last_activity=active_sessions[container_id]
+             uptime_seconds=now - session.last_activity,
+             last_activity=session.last_activity
          )
     except docker.errors.NotFound:
          del active_sessions[container_id]
@@ -593,6 +759,8 @@ async def execute_code(request: ExecuteRequest, _auth: bool = Depends(verify_api
             )
 
         try:
+            await check_rate_limit(request.container_id or execution_id)
+
             result = await run_code_in_sandbox(
                 container_id=request.container_id,
                 language=request.language,
