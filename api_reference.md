@@ -162,7 +162,7 @@ You can request specific PyPI packages via the `pip_packages` field. These are i
 ## Health & Monitoring
 
 ### Health Check
-`GET /health`
+`GET /healthz`
 Returns status of the Docker connection and sandbox image availability.
 
 ### Metrics

@@ -114,8 +114,23 @@ def infer_network_enabled(container: docker.models.containers.Container) -> bool
 
 def touch_session(container_id: str):
     session = active_sessions.get(container_id)
-    if session:
-        session.last_activity = time.time()
+    if session is None:
+        return
+    # Backward-compat: older code accidentally stored a raw timestamp (float)
+    # instead of a SessionInfo.
+    if isinstance(session, (int, float)):
+        try:
+            container = docker_client.containers.get(container_id)
+            network_enabled = infer_network_enabled(container)
+        except Exception:
+            network_enabled = SANDBOX_NETWORK_MODE != "none"
+        active_sessions[container_id] = SessionInfo(
+            last_activity=time.time(),
+            network_enabled=network_enabled,
+        )
+        return
+
+    session.last_activity = time.time()
 
 
 async def check_rate_limit(key: str):
@@ -515,7 +530,7 @@ async def run_code_in_sandbox(
          raise HTTPException(status_code=404, detail="Container session not found.")
     
     # Update activity
-    active_sessions[container_id] = time.time()
+    touch_session(container_id)
 
     # Base64-encode the code for safe env var transport
     code_b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
@@ -795,7 +810,7 @@ async def execute_code(request: ExecuteRequest, _auth: bool = Depends(verify_api
         metrics["active_executions"] -= 1
 
 
-@app.get("/health")
+@app.get("/healthz")
 async def health_check():
     """Health check endpoint."""
     try:
@@ -816,7 +831,7 @@ async def health_check():
     return JSONResponse(
         status_code=200 if healthy else 503,
         content={
-            "status": "healthy" if healthy else "degraded",
+            "status": "ok" if healthy else "degraded",
             "docker_connected": docker_ok,
             "sandbox_image_available": image_ok,
             "sandbox_image": SANDBOX_IMAGE,

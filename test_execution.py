@@ -63,7 +63,7 @@ def execute(code: str, timeout: int = 30, enable_network: bool = True) -> dict:
 def test_health():
     """Test the health endpoint."""
     try:
-        req = urllib.request.Request(f"{BASE_URL}/health")
+        req = urllib.request.Request(f"{BASE_URL}/healthz")
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             assert data["status"] == "healthy", f"Service unhealthy: {data}"
