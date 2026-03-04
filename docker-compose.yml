@@ -23,6 +23,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Seccomp profile for sandbox containers
       - ./security/seccomp-profile.json:/etc/code-execution/seccomp-profile.json:ro
+      - ./.env_sandbox:/etc/code-execution/.env_sandbox:ro
+      - ./.env.example:/etc/code-execution/.env.example:ro
     environment:
       - SANDBOX_IMAGE=${SANDBOX_IMAGE:-code-sandbox:latest}
       - MAX_CONCURRENT_EXECUTIONS=${MAX_CONCURRENT_EXECUTIONS:-10}
@@ -35,6 +37,8 @@ services:
       - SANDBOX_TMPFS_SIZE=${SANDBOX_TMPFS_SIZE:-100m}
       - SANDBOX_NETWORK_MODE=${SANDBOX_NETWORK_MODE:-bridge}
       - SECCOMP_PROFILE_PATH=/etc/code-execution/seccomp-profile.json
+      - SANDBOX_ENV_SOURCE_PATH=/etc/code-execution/.env_sandbox
+      - SANDBOX_ENV_FALLBACK_SOURCE_PATH=/etc/code-execution/.env.example
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - API_KEY=${API_KEY}
     healthcheck:

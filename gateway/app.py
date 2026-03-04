@@ -66,6 +66,12 @@ PIP_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*([\[,\]A-Za-z0-9._
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS_PER_WINDOW", "30"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
+SANDBOX_ENV_TARGET_PATH = os.getenv("SANDBOX_ENV_TARGET_PATH", "/home/sandbox/.env")
+_DEFAULT_ENV_SANDBOX_SOURCE = str(Path(__file__).resolve().parents[1] / ".env_sandbox")
+_DEFAULT_ENV_EXAMPLE_SOURCE = str(Path(__file__).resolve().parents[1] / ".env.example")
+SANDBOX_ENV_SOURCE_PATH = os.getenv("SANDBOX_ENV_SOURCE_PATH", _DEFAULT_ENV_SANDBOX_SOURCE)
+SANDBOX_ENV_FALLBACK_SOURCE_PATH = os.getenv("SANDBOX_ENV_FALLBACK_SOURCE_PATH", _DEFAULT_ENV_EXAMPLE_SOURCE)
+
 # --- Logging ---
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -442,11 +448,46 @@ async def create_container_session(enable_network: bool = True) -> str:
         lambda: docker_client.containers.run(detach=True, **container_config),
     )
 
+    await ensure_sandbox_env_file(container, execution_id=execution_id)
+
     active_sessions[container.id] = SessionInfo(
         last_activity=time.time(),
         network_enabled=enable_network,
     )
     return container.id
+
+
+def _read_env_source_bytes() -> Optional[bytes]:
+    for path_str in (SANDBOX_ENV_SOURCE_PATH, SANDBOX_ENV_FALLBACK_SOURCE_PATH):
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if p.exists() and p.is_file():
+            try:
+                return p.read_bytes()
+            except Exception as e:
+                logger.warning(f"Failed reading env source file '{p}': {e}")
+                return None
+    return None
+
+
+async def ensure_sandbox_env_file(container: docker.models.containers.Container, execution_id: str) -> None:
+    env_bytes = _read_env_source_bytes()
+    if env_bytes is None:
+        return
+
+    try:
+        target = Path(SANDBOX_ENV_TARGET_PATH)
+        tar_data = create_tar_archive_from_files(
+            [PreparedFile(name=str(target.name), content=env_bytes)]
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: container.put_archive(str(target.parent), tar_data),
+        )
+    except Exception as e:
+        logger.warning(f"[{execution_id}] Failed to provision sandbox .env file: {e}")
 
 
 def create_tar_archive_from_files(files: list[PreparedFile]) -> bytes:
@@ -531,6 +572,8 @@ async def run_code_in_sandbox(
     
     # Update activity
     touch_session(container_id)
+
+    await ensure_sandbox_env_file(container, execution_id=execution_id)
 
     # Base64-encode the code for safe env var transport
     code_b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
