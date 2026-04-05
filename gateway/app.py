@@ -49,8 +49,11 @@ MAX_TIMEOUT = int(os.getenv("MAX_TIMEOUT", "120"))
 SANDBOX_MEM_LIMIT = os.getenv("SANDBOX_MEM_LIMIT", "512m")
 SANDBOX_CPU_PERIOD = int(os.getenv("SANDBOX_CPU_PERIOD", "100000"))
 SANDBOX_CPU_QUOTA = int(os.getenv("SANDBOX_CPU_QUOTA", "100000"))  # 1 core
-SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "64"))
+SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
 SANDBOX_TMPFS_SIZE = os.getenv("SANDBOX_TMPFS_SIZE", "100m")
+SANDBOX_MPL_CACHE_TMPFS_SIZE = os.getenv("SANDBOX_MPL_CACHE_TMPFS_SIZE", "32m")
+SANDBOX_MISC_TMPFS_SIZE = os.getenv("SANDBOX_MISC_TMPFS_SIZE", "128m")
+SANDBOX_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "128m")
 SANDBOX_NETWORK_MODE = os.getenv("SANDBOX_NETWORK_MODE", "bridge")  # "bridge" or "none"
 SECCOMP_PROFILE_PATH = os.getenv("SECCOMP_PROFILE_PATH", "/etc/code-execution/seccomp-profile.json")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -415,11 +418,12 @@ async def create_container_session(enable_network: bool = True) -> str:
         "cpu_period": SANDBOX_CPU_PERIOD,
         "cpu_quota": SANDBOX_CPU_QUOTA,
         "pids_limit": SANDBOX_PIDS_LIMIT,
+        "shm_size": SANDBOX_SHM_SIZE,
         "network_mode": network_mode,
         "tmpfs": {
             "/tmp/output": f"size={SANDBOX_TMPFS_SIZE},mode=1777",
-            "/tmp/mpl_cache": "size=10m,mode=1777",
-            "/tmp/misc": "size=10m,mode=1777",
+            "/tmp/mpl_cache": f"size={SANDBOX_MPL_CACHE_TMPFS_SIZE},mode=1777",
+            "/tmp/misc": f"size={SANDBOX_MISC_TMPFS_SIZE},mode=1777",
         },
         "environment": {
             "MPLCONFIGDIR": "/tmp/mpl_cache",

@@ -10,6 +10,8 @@
 
 FROM python:3.12-slim AS base
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 # --- System Setup ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -27,14 +29,19 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt && \
     rm /tmp/requirements.txt
 
+# --- Playwright Browser Runtime ---
+# Install Chromium + required system libraries at build time so sandbox
+# sessions can use Playwright without runtime downloads.
+RUN python -m playwright install --with-deps chromium
+
 # --- Pre-compile matplotlib font cache ---
 RUN python -c "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; plt.figure(); plt.close()" 2>/dev/null || true
 
 # --- Non-root User ---
 RUN groupadd -r sandbox && \
     useradd -r -g sandbox -d /home/sandbox -s /sbin/nologin sandbox && \
-    mkdir -p /home/sandbox /tmp/code /tmp/output && \
-    chown -R sandbox:sandbox /home/sandbox /tmp/code /tmp/output
+    mkdir -p /home/sandbox /tmp/code /tmp/output /ms-playwright && \
+    chown -R sandbox:sandbox /home/sandbox /tmp/code /tmp/output /ms-playwright
 
 # --- Executor Script ---
 COPY executor.py /usr/local/bin/executor.py
