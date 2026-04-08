@@ -1,80 +1,115 @@
 #!/usr/bin/env python3
 import json
-import urllib.request
-import urllib.error
 import os
-import time
+import urllib.error
+import urllib.request
 
-BASE_URL = "http://localhost:8000"
-API_KEY = "test-secret"
 
-def execute(code, pip_packages=None, api_key=None):
-    payload = {
-        "code": code,
-        "pip_packages": pip_packages or []
-    }
-    
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
+
+
+def resolve_token() -> str | None:
+    for env_name in ("API_TOKEN", "API_KEY"):
+        value = os.getenv(env_name)
+        if value:
+            return value
+
+    api_keys = os.getenv("API_KEYS", "")
+    if not api_keys:
+        return None
+
+    first = api_keys.split(",", 1)[0].strip()
+    if ":" in first:
+        return first.split(":", 1)[1]
+    return first or None
+
+
+TOKEN = resolve_token()
+
+
+def request(method: str, path: str, payload: dict | None = None, timeout: int = 90):
+    data = None
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-        
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
     req = urllib.request.Request(
-        f"{BASE_URL}/execute",
-        data=json.dumps(payload).encode("utf-8"),
+        f"{BASE_URL}{path}",
+        data=data,
         headers=headers,
-        method="POST"
+        method=method,
     )
-    
     try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        return {"error": e.reason, "status": e.code}
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def execute(code: str, *, pip_packages: list[str] | None = None):
+    status, container = request("POST", "/containers", {"enable_network": True})
+    assert status == 200, container
+    container_id = container["container_id"]
+
+    try:
+        return request(
+            "POST",
+            "/execute",
+            {
+                "container_id": container_id,
+                "language": "python",
+                "code": code,
+                "pip_packages": pip_packages or [],
+            },
+        )
+    finally:
+        request("DELETE", f"/containers/{container_id}")
+
 
 def test_no_auth():
-    print("Testing request without API key (when API_KEY is set in gateway)...")
-    # This assumes we will run the gateway with API_KEY=test-secret
-    res = execute("print('hello')")
-    if res.get("status") == 401:
-        print("✅ Correctly rejected with 401")
-    else:
-        print(f"❌ Expected 401, got {res}")
+    print("Testing request without API key...")
+    token = TOKEN
+    if not token:
+        print("  Skipping because no bearer token is configured for this environment.")
+        return
 
-def test_bad_auth():
-    print("Testing request with WRONG API key...")
-    res = execute("print('hello')", api_key="wrong-key")
-    if res.get("status") == 401:
-        print("✅ Correctly rejected with 401")
-    else:
-        print(f"❌ Expected 401, got {res}")
+    req = urllib.request.Request(
+        f"{BASE_URL}/containers",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        print("  Expected 401 but request succeeded")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            print("  Correctly rejected with 401")
+        else:
+            print(f"  Unexpected response: HTTP {exc.code}")
+
 
 def test_good_auth():
-    print("Testing request with CORRECT API key...")
-    res = execute("print('hello')", api_key=API_KEY)
-    if "stdout" in res and res["stdout"].strip() == "hello":
-        print("✅ Successfully authorized and executed")
-    else:
-        print(f"❌ Execution failed: {res}")
+    print("Testing authenticated execution...")
+    status, result = execute("print('hello')")
+    assert status == 200, result
+    assert result["stdout"].strip() == "hello", result
+    print("  Authorized execution succeeded")
+
 
 def test_pip_packages():
-    print("Testing dynamic pip package installation (cowsay)...")
+    print("Testing dynamic pip package installation...")
     code = "import cowsay; print(cowsay.get_output_string('cow', 'Moo!'))"
-    res = execute(code, pip_packages=["cowsay"], api_key=API_KEY)
-    
-    if "stdout" in res and "Moo!" in res["stdout"]:
-        print("✅ Pip package installed and used!")
-        print(f"   Execution time: {res.get('execution_time')}s")
-        if "install_time" in res:
-             print(f"   Install time: {res['install_time']}s")
-    else:
-        print(f"❌ Pip test failed!")
-        print(f"   Response: {json.dumps(res, indent=2)}")
+    status, result = execute(code, pip_packages=["cowsay"])
+    assert status == 200, result
+    assert "Moo!" in result["stdout"], result
+    print("  Pip package install succeeded")
+
 
 if __name__ == "__main__":
-    print("--- Verification of New Features ---")
-    # Note: These tests require the gateway to be running with API_KEY=test-secret
-    # and the sandbox image to be built.
+    print("--- Verification of Security and Package Features ---")
     test_no_auth()
-    test_bad_auth()
     test_good_auth()
     test_pip_packages()

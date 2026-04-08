@@ -1,6 +1,7 @@
 SHELL := /bin/bash
 
 COMPOSE := docker compose
+COMPOSE_LOCAL := docker compose --profile local-docker
 DEFAULT_GOAL := help
 
 .PHONY: help setup build up down restart logs ps update
@@ -8,8 +9,8 @@ DEFAULT_GOAL := help
 help:
 	@echo "Available targets:"
 	@echo "  setup         Create .env from .env.example if it doesn't exist"
-	@echo "  build         Build the sandbox Docker image"
-	@echo "  up            Start stack"
+	@echo "  build         Build the local development images"
+	@echo "  up            Start the local development stack"
 	@echo "  down          Stop containers but keep data volumes"
 	@echo "  restart       Restart all services"
 	@echo "  logs          Follow logs for all services"
@@ -20,21 +21,21 @@ setup:
 	@./setup.sh
 
 build: setup
-	$(COMPOSE) build sandbox
+	$(COMPOSE_LOCAL) build
 
 up: build
-	$(COMPOSE) up -d
+	$(COMPOSE_LOCAL) up -d
 
 down:
-	$(COMPOSE) down --remove-orphans || true
+	$(COMPOSE_LOCAL) down --remove-orphans || true
 
 restart: down up
 
 logs:
-	$(COMPOSE) logs -f
+	$(COMPOSE_LOCAL) logs -f
 
 ps:
-	$(COMPOSE) ps
+	$(COMPOSE_LOCAL) ps
 
 update:
 	git pull --rebase --autostash

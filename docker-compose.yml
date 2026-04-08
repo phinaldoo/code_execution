@@ -2,34 +2,105 @@
 # Code Execution Service — Docker Compose
 # ============================================================
 # Usage:
-#   docker compose build    # Build all images
-#   docker compose up -d    # Start the gateway
-#   docker compose logs -f  # View logs
-#   docker compose down     # Stop everything
+#   docker compose --profile local-docker build    # Local development build
+#   docker compose --profile local-docker up -d    # Start the local gateway stack
+#   docker compose --profile local-docker logs -f  # View local logs
+#   docker compose --profile local-docker down     # Stop the local stack
 # ============================================================
 
 services:
+  docker-proxy:
+    profiles:
+      - local-docker
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.4.2
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /run:rw,noexec,nosuid,nodev,size=1m
+      - /tmp:rw,noexec,nosuid,nodev,size=8m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - LOG_LEVEL=warning
+      - EVENTS=0
+      - POST=1
+      - CONTAINERS=1
+      - ALLOW_START=1
+      - ALLOW_RESTARTS=1
+      - EXEC=1
+      - IMAGES=1
+      - INFO=1
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "-O", "-", "http://localhost:2375/_ping" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - control-plane
+
+  redis:
+    image: redis:7.4.2-alpine
+    restart: unless-stopped
+    command: [ "redis-server", "--save", "", "--appendonly", "no" ]
+    tmpfs:
+      - /data:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - control-plane
+
   # --- API Gateway ---
   gateway:
+    image: code-gateway:latest
     build:
       context: ./gateway
       dockerfile: Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.12-slim-bookworm@sha256:dba9a3ac4914b5ae6f790188ff39267e46e0087fa0f4713592b5d32350edb5ef}
     container_name: code-execution-gateway
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     ports:
       - "${GATEWAY_PORT:-8000}:8000"
     volumes:
-      # Docker socket — required for the gateway to manage sandbox containers
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Seccomp profile for sandbox containers
-      - ./security/seccomp-profile.json:/etc/code-execution/seccomp-profile.json:ro
       - ./.env_sandbox:/etc/code-execution/.env_sandbox:ro
-      - ./.env.example:/etc/code-execution/.env.example:ro
     environment:
+      - APP_ENV=${APP_ENV:-development}
+      - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
+      - METRICS_AUTH_REQUIRED=${METRICS_AUTH_REQUIRED:-true}
+      - REQUIRE_SHARED_STATE=${REQUIRE_SHARED_STATE:-true}
       - SANDBOX_IMAGE=${SANDBOX_IMAGE:-code-sandbox:latest}
       - MAX_CONCURRENT_EXECUTIONS=${MAX_CONCURRENT_EXECUTIONS:-10}
+      - MAX_ACTIVE_SESSIONS=${MAX_ACTIVE_SESSIONS:-100}
+      - MAX_CONTAINERS_PER_PRINCIPAL=${MAX_CONTAINERS_PER_PRINCIPAL:-3}
+      - CONTAINER_CREATE_GUARD_TIMEOUT=${CONTAINER_CREATE_GUARD_TIMEOUT:-30}
       - DEFAULT_TIMEOUT=${DEFAULT_TIMEOUT:-30}
       - MAX_TIMEOUT=${MAX_TIMEOUT:-120}
+      - CONTAINER_RATE_LIMIT_REQUESTS_PER_WINDOW=${CONTAINER_RATE_LIMIT_REQUESTS_PER_WINDOW:-10}
+      - CONTAINER_RATE_LIMIT_WINDOW_SECONDS=${CONTAINER_RATE_LIMIT_WINDOW_SECONDS:-60}
       - SANDBOX_MEM_LIMIT=${SANDBOX_MEM_LIMIT:-512m}
       - SANDBOX_CPU_PERIOD=${SANDBOX_CPU_PERIOD:-100000}
       - SANDBOX_CPU_QUOTA=${SANDBOX_CPU_QUOTA:-100000}
@@ -38,12 +109,20 @@ services:
       - SANDBOX_MPL_CACHE_TMPFS_SIZE=${SANDBOX_MPL_CACHE_TMPFS_SIZE:-32m}
       - SANDBOX_MISC_TMPFS_SIZE=${SANDBOX_MISC_TMPFS_SIZE:-128m}
       - SANDBOX_SHM_SIZE=${SANDBOX_SHM_SIZE:-128m}
-      - SANDBOX_NETWORK_MODE=${SANDBOX_NETWORK_MODE:-bridge}
-      - SECCOMP_PROFILE_PATH=/etc/code-execution/seccomp-profile.json
+      - SANDBOX_HOME_TMPFS_SIZE=${SANDBOX_HOME_TMPFS_SIZE:-256m}
+      - SANDBOX_NETWORK_MODE=${SANDBOX_NETWORK_MODE:-none}
+      - SANDBOX_UID=${SANDBOX_UID:-10001}
+      - SANDBOX_GID=${SANDBOX_GID:-10001}
+      - ALLOW_PIP_INSTALLS=${ALLOW_PIP_INSTALLS:-false}
+      - USE_DOCKER_DEFAULT_SECCOMP=${USE_DOCKER_DEFAULT_SECCOMP:-true}
+      - ALLOW_SANDBOX_ENV_INJECTION=${ALLOW_SANDBOX_ENV_INJECTION:-false}
+      - DOCKER_HOST=${DOCKER_HOST:-tcp://docker-proxy:2375}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - SANDBOX_ENV_SOURCE_PATH=/etc/code-execution/.env_sandbox
-      - SANDBOX_ENV_FALLBACK_SOURCE_PATH=/etc/code-execution/.env.example
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - API_KEY=${API_KEY}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:3000}
+      - CORS_ALLOW_CREDENTIALS=${CORS_ALLOW_CREDENTIALS:-true}
+      - API_KEYS=${API_KEYS:-}
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8000/healthz" ]
       interval: 30s
@@ -55,14 +134,23 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    networks:
+      - default
+      - control-plane
 
   # --- Sandbox Image Builder ---
   # This service only builds the sandbox image; it doesn't run.
   sandbox:
+    image: code-sandbox:latest
     build:
       context: ./sandbox
       dockerfile: Dockerfile
-    image: code-sandbox:latest
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.12-slim-bookworm@sha256:dba9a3ac4914b5ae6f790188ff39267e46e0087fa0f4713592b5d32350edb5ef}
     entrypoint: [ "echo", "Sandbox image built successfully" ]
     profiles:
       - build
+
+networks:
+  control-plane:
+    internal: true

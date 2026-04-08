@@ -4,6 +4,40 @@ set -euo pipefail
 EXAMPLE_FILE=".env.example"
 TARGET_FILE=".env"
 
+ensure_default_api_keys() {
+  local target_file="$1"
+
+  if grep -Eq '^API_KEYS=[^[:space:]].+' "$target_file"; then
+    return
+  fi
+
+  local secret
+  secret="$(openssl rand -hex 32)"
+  python3 - "$target_file" "$secret" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+secret = sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines()
+updated = []
+replaced = False
+
+for line in lines:
+    if line.startswith("API_KEYS="):
+        updated.append(f"API_KEYS=local:{secret}")
+        replaced = True
+    else:
+        updated.append(line)
+
+if not replaced:
+    updated.append(f"API_KEYS=local:{secret}")
+
+path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+PY
+  printf 'Generated a local API_KEYS secret in %s\n' "$target_file"
+}
+
 sync_env_with_example() {
   local example_file="$1"
   local target_file="$2"
@@ -55,3 +89,5 @@ if [ ! -f "$TARGET_FILE" ]; then
 else
   sync_env_with_example "$EXAMPLE_FILE" "$TARGET_FILE"
 fi
+
+ensure_default_api_keys "$TARGET_FILE"

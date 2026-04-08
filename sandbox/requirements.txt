@@ -1,32 +1,32 @@
 # Core scientific computing
-numpy>=1.26,<2.0
-pandas>=2.2,<3.0
-scipy>=1.12,<2.0
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.14.1
 
 # Visualization
-matplotlib>=3.8,<4.0
-seaborn>=0.13,<1.0
-Pillow>=10.0,<11.0
-plotly>=5.20,<6.0
+matplotlib==3.9.2
+seaborn==0.13.2
+Pillow==10.4.0
+plotly==5.24.1
 
 # Machine learning
-scikit-learn>=1.4,<2.0
+scikit-learn==1.5.2
 
 # Symbolic math
-sympy>=1.12,<2.0
+sympy==1.13.3
 
 # HTTP requests (internet access enabled)
-requests>=2.31,<3.0
+requests==2.32.3
 
 # Browser automation
-playwright>=1.52,<2.0
+playwright==1.52.0
 
 # Data formats
-openpyxl>=3.1,<4.0
-pyyaml>=6.0,<7.0
+openpyxl==3.1.5
+pyyaml==6.0.2
 
 # PDF generation
-reportlab>=4.0,<5.0
+reportlab==4.2.5
 
 # Word document processing
-python-docx>=1.1,<2.0
+python-docx==1.1.2

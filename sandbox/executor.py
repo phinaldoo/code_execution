@@ -22,31 +22,49 @@ import shutil
 import sys
 import time
 import traceback
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 # --- Configuration ---
 CODE_PATH = Path("/tmp/code/main.py")
+# Module-level defaults, updated in main() with per-execution scoping
 OUTPUT_DIR = Path("/tmp/output")
+MISC_DIR = Path("/tmp/misc")
 MAX_OUTPUT_LENGTH = 100_000  # Max chars for stdout/stderr
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB per file
-MAX_TOTAL_FILES_SIZE = 100 * 1024 * 1024  # 100MB total
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file
+MAX_TOTAL_FILES_SIZE = 25 * 1024 * 1024  # 25MB total
+RESULT_PREFIX = "__EXECUTOR_RESULT__:"
+
+
+def get_exec_timeout(default: int = 120) -> int:
+    raw_value = os.environ.get("EXEC_TIMEOUT", "").strip()
+    if not raw_value:
+        return default
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return default
 
 
 def setup_output_dir():
     """Ensure the output directory exists and is clean."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    clear_output_dir()
 
 
 def clear_output_dir():
-    """Clear all contents of the output directory after execution."""
-    if not OUTPUT_DIR.exists():
-        return
-    for item in OUTPUT_DIR.iterdir():
-        if item.is_file() or item.is_symlink():
-            item.unlink()
-        elif item.is_dir():
-            shutil.rmtree(item)
+    """Clear the per-execution output and misc directories after execution."""
+    if OUTPUT_DIR.exists():
+        shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+    if MISC_DIR.exists():
+        shutil.rmtree(MISC_DIR, ignore_errors=True)
+    # Remove empty parent dirs if possible
+    for parent in (OUTPUT_DIR.parent, MISC_DIR.parent):
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
 
 
 def patch_matplotlib():
@@ -98,14 +116,40 @@ def collect_output_files():
     if not OUTPUT_DIR.exists():
         return files
 
+    output_root = OUTPUT_DIR.resolve()
+
     for filepath in sorted(OUTPUT_DIR.rglob("*")):
         if not filepath.is_file():
+            continue
+
+        relative_name = str(filepath.relative_to(OUTPUT_DIR))
+        if filepath.is_symlink():
+            files.append({
+                "name": relative_name,
+                "content": None,
+                "mime_type": "application/octet-stream",
+                "error": "Symlink outputs are not supported",
+                "size": 0,
+            })
+            continue
+
+        try:
+            resolved_path = filepath.resolve(strict=True)
+            resolved_path.relative_to(output_root)
+        except (FileNotFoundError, RuntimeError, ValueError):
+            files.append({
+                "name": relative_name,
+                "content": None,
+                "mime_type": "application/octet-stream",
+                "error": "Output file resolves outside the sandbox output directory",
+                "size": 0,
+            })
             continue
 
         file_size = filepath.stat().st_size
         if file_size > MAX_FILE_SIZE:
             files.append({
-                "name": filepath.name,
+                "name": relative_name,
                 "content": None,
                 "mime_type": "application/octet-stream",
                 "error": f"File too large ({file_size} bytes, max {MAX_FILE_SIZE})",
@@ -115,7 +159,7 @@ def collect_output_files():
 
         if total_size + file_size > MAX_TOTAL_FILES_SIZE:
             files.append({
-                "name": filepath.name,
+                "name": relative_name,
                 "content": None,
                 "mime_type": "application/octet-stream",
                 "error": "Total file size limit exceeded",
@@ -126,7 +170,7 @@ def collect_output_files():
         total_size += file_size
 
         # Detect MIME type
-        mime_type, _ = mimetypes.guess_type(filepath.name)
+        mime_type, _ = mimetypes.guess_type(relative_name)
         if mime_type is None:
             mime_type = "application/octet-stream"
 
@@ -135,7 +179,7 @@ def collect_output_files():
             content = f.read()
 
         files.append({
-            "name": filepath.name,
+            "name": relative_name,
             "content": base64.b64encode(content).decode("ascii"),
             "mime_type": mime_type,
             "size": file_size,
@@ -150,6 +194,58 @@ def truncate_output(text: str, max_length: int = MAX_OUTPUT_LENGTH) -> str:
         truncated_msg = f"\n\n... [OUTPUT TRUNCATED — {len(text)} chars total, showing first {max_length}]"
         return text[:max_length] + truncated_msg
     return text
+
+
+def _list_residual_pids() -> list[int]:
+    current_pid = os.getpid()
+    pids: list[int] = []
+
+    for proc_entry in Path("/proc").iterdir():
+        if not proc_entry.name.isdigit():
+            continue
+
+        pid = int(proc_entry.name)
+        if pid in {1, current_pid}:
+            continue
+
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            continue
+        pids.append(pid)
+
+    return pids
+
+
+def terminate_residual_processes() -> None:
+    # NOTE: This kills ALL processes except PID 1 and ourselves. This is safe
+    # because the gateway serializes execution per container (one exec at a time).
+    residual_pids = _list_residual_pids()
+    if not residual_pids:
+        return
+
+    for sig, deadline_seconds in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
+        for pid in residual_pids:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                continue
+
+        deadline = time.monotonic() + deadline_seconds
+        while time.monotonic() < deadline:
+            remaining = []
+            for pid in residual_pids:
+                try:
+                    os.kill(pid, 0)
+                    remaining.append(pid)
+                except (ProcessLookupError, PermissionError):
+                    continue
+
+            if not remaining:
+                return
+
+            residual_pids = remaining
+            time.sleep(0.05)
 
 
 def execute_code(code: str) -> dict:
@@ -202,7 +298,7 @@ def execute_code(code: str) -> dict:
 
     execution_time = round(time.monotonic() - start_time, 4)
 
-    # Collect any generated files
+    terminate_residual_processes()
     files = collect_output_files()
 
     return {
@@ -224,7 +320,7 @@ def execute_bash(code: str) -> dict:
     error_type = None
 
     # Write code to a temporary script file inside the tmpfs mount
-    script_path = Path("/tmp/misc/script.sh")
+    script_path = MISC_DIR / "script.sh"
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(code, encoding="utf-8")
     script_path.chmod(0o755)
@@ -235,7 +331,7 @@ def execute_bash(code: str) -> dict:
             ["/bin/bash", str(script_path)],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=get_exec_timeout(),
         )
         
         stdout_text = result.stdout
@@ -262,7 +358,7 @@ def execute_bash(code: str) -> dict:
 
     execution_time = round(time.monotonic() - start_time, 4)
 
-    # Collect any generated files
+    terminate_residual_processes()
     files = collect_output_files()
 
     return {
@@ -287,12 +383,13 @@ def install_pip_packages():
 
     import subprocess
     import importlib
+    install_timeout = get_exec_timeout()
     start_install = time.monotonic()
     try:
         # Install to user directory to avoid permission issues
         # --no-cache-dir to keep it clean and fast
         cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", "--quiet"] + packages
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=install_timeout)
         
         install_time = round(time.monotonic() - start_install, 2)
         
@@ -304,15 +401,29 @@ def install_pip_packages():
             return error_msg, install_time
             
         return None, install_time
+    except subprocess.TimeoutExpired:
+        return f"Pip install timed out after {install_timeout} seconds", round(time.monotonic() - start_install, 2)
     except Exception as e:
         return f"Pip install exception: {str(e)}", round(time.monotonic() - start_install, 2)
 
 
+def emit_result(result: dict) -> None:
+    payload = json.dumps(result)
+    print(f"{RESULT_PREFIX}{payload}")
+
+
 def main():
     """Main entry point for the executor."""
+    global OUTPUT_DIR, MISC_DIR
+
     parser = argparse.ArgumentParser(description="Code Executor")
     parser.add_argument("--lang", type=str, choices=["python", "bash"], default="python", help="Language to execute")
+    parser.add_argument("--exec-id", type=str, default=None, help="Unique execution identifier for output isolation")
     args = parser.parse_args()
+
+    exec_id = args.exec_id or uuid.uuid4().hex[:12]
+    OUTPUT_DIR = Path(f"/tmp/output/{exec_id}")
+    MISC_DIR = Path(f"/tmp/misc/{exec_id}")
 
     setup_output_dir()
 
@@ -325,7 +436,7 @@ def main():
         # Ensure user site-packages are in sys.path
         import site
         user_site = site.getusersitepackages()
-        if user_site not in sys.path:
+        if user_site and user_site not in sys.path:
             sys.path.append(user_site)
     else:
         install_error, install_time = None, None
@@ -345,7 +456,7 @@ def main():
                 "files": [],
                 "execution_time": 0,
             }
-            print(json.dumps(result))
+            emit_result(result)
             sys.exit(1)
     else:
         result = {
@@ -356,7 +467,7 @@ def main():
             "files": [],
             "execution_time": 0,
         }
-        print(json.dumps(result))
+        emit_result(result)
         sys.exit(1)
 
     if not code.strip():
@@ -368,7 +479,7 @@ def main():
             "files": [],
             "execution_time": 0,
         }
-        print(json.dumps(result))
+        emit_result(result)
         sys.exit(1)
 
     # Execute the code
@@ -392,9 +503,8 @@ def main():
     clear_output_dir()
 
     # Output as JSON — stdout was captured, so real stdout is clean
-    print(json.dumps(result))
+    emit_result(result)
 
 
 if __name__ == "__main__":
     main()
-

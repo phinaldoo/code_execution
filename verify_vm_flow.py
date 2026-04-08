@@ -1,91 +1,131 @@
-import asyncio
-import httpx
+#!/usr/bin/env python3
 import base64
-import time
+import json
+import os
+import urllib.error
+import urllib.request
 
-BASE_URL = "http://localhost:8000"
 
-async def test_flow():
-    async with httpx.AsyncClient(timeout=30) as client:
-        print("1. Checking health...")
-        r = await client.get(f"{BASE_URL}/health")
-        print(f"Health: {r.status_code}")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 
-        print("\n2. Creating container session...")
-        r = await client.post(f"{BASE_URL}/containers", json={})
-        if r.status_code != 200:
-            print(f"Failed to create container: {r.text}")
-            return
-            
-        data = r.json()
-        container_id = data["container_id"]
-        print(f"Container created! ID: {container_id}")
 
-        print("\n3. Checking container status...")
-        r = await client.get(f"{BASE_URL}/containers/{container_id}")
-        data = r.json()
-        print(f"Status: {data['status']}, Uptime: {data['uptime_seconds']:.2f}s")
-        
-        print("\n4. Executing Python code...")
-        python_code = "print('Hello from persistent Python session!')\nimport os\nwith open('/home/sandbox/test.txt', 'w') as f:\n  f.write('Python was here')"
-        r = await client.post(f"{BASE_URL}/execute", json={
-            "container_id": container_id,
-            "language": "python",
-            "code": python_code,
-        })
-        if r.status_code != 200:
-             print(f"Failed Python execute: {r.text}")
-        else:
-             print("Python output:", r.json()["stdout"].strip())
+def resolve_token() -> str | None:
+    for env_name in ("API_TOKEN", "API_KEY"):
+        value = os.getenv(env_name)
+        if value:
+            return value
 
-        print("\n5. Executing Bash code (and reading the file Python wrote)...")
-        bash_code = "echo 'Hello from Bash!'\nls -l /home/sandbox\ncat /home/sandbox/test.txt"
-        r = await client.post(f"{BASE_URL}/execute", json={
-            "container_id": container_id,
-            "language": "bash",
-            "code": bash_code,
-        })
-        if r.status_code != 200:
-             print(f"Failed Bash execute: {r.text}")
-        else:
-             print("Bash output:\n", r.json()["stdout"].strip())
-             
-        print("\n6. Testing Input File Upload and Output Retrieval...")
-        input_content = "This is a secret message uploaded from host."
-        input_b64 = base64.b64encode(input_content.encode()).decode()
-        
-        script = """#!/bin/bash
-echo "Reading input file:"
-cat /home/sandbox/input.txt
-echo "Writing output file:"
-echo "Processed: $(cat /home/sandbox/input.txt)" > /tmp/output/result.txt
-"""
-        r = await client.post(f"{BASE_URL}/execute", json={
-            "container_id": container_id,
-            "language": "bash",
-            "code": script,
-            "files": [
-                {"name": "input.txt", "content": input_b64}
-            ]
-        })
-        if r.status_code != 200:
-             print(f"Failed File Task: {r.text}")
-        else:
-             resp = r.json()
-             print("Script stdout:\n", resp["stdout"].strip())
-             files = resp["files"]
-             print(f"Files returned: {len(files)}")
-             if len(files) > 0:
-                 decoded = base64.b64decode(files[0]["content"]).decode()
-                 print(f"File '{files[0]['name']}' content: {decoded}")
+    api_keys = os.getenv("API_KEYS", "")
+    if not api_keys:
+        return None
 
-        print("\n7. Deleting container session...")
-        r = await client.delete(f"{BASE_URL}/containers/{container_id}")
-        print("Delete response:", r.json())
+    first = api_keys.split(",", 1)[0].strip()
+    if ":" in first:
+        return first.split(":", 1)[1]
+    return first or None
 
-        print("\n8. Checking container status again (should be 404)...")
-        r = await client.get(f"{BASE_URL}/containers/{container_id}")
-        print("Status check after delete:", r.status_code)
+
+TOKEN = resolve_token()
+
+
+def request(method: str, path: str, payload: dict | None = None, timeout: int = 60):
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{BASE_URL}{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            return response.status, json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        return exc.code, json.loads(body) if body else {}
+
+
+def main():
+    print("1. Checking health...")
+    status, payload = request("GET", "/healthz")
+    assert status == 200, payload
+    assert payload["status"] == "healthy", payload
+    print("   Health OK")
+
+    print("2. Creating container session...")
+    status, created = request("POST", "/containers", {"enable_network": True})
+    assert status == 200, created
+    container_id = created["container_id"]
+    print(f"   Container: {container_id}")
+
+    try:
+        print("3. Executing Python code...")
+        python_code = (
+            "print('Hello from persistent Python session!')\n"
+            "with open('/home/sandbox/test.txt', 'w', encoding='utf-8') as handle:\n"
+            "    handle.write('Python was here')\n"
+        )
+        status, result = request(
+            "POST",
+            "/execute",
+            {
+                "container_id": container_id,
+                "language": "python",
+                "code": python_code,
+            },
+        )
+        assert status == 200, result
+        assert "Hello from persistent Python session!" in result["stdout"], result
+        print("   Python execution OK")
+
+        print("4. Executing Bash code...")
+        bash_code = "echo 'Hello from Bash!'\ncat /home/sandbox/test.txt"
+        status, result = request(
+            "POST",
+            "/execute",
+            {
+                "container_id": container_id,
+                "language": "bash",
+                "code": bash_code,
+            },
+        )
+        assert status == 200, result
+        assert "Python was here" in result["stdout"], result
+        print("   Bash execution OK")
+
+        print("5. Testing input/output file flow...")
+        input_b64 = base64.b64encode(b"This is a secret message uploaded from host.").decode("ascii")
+        script = (
+            "cat /home/sandbox/input.txt\n"
+            "echo \"Processed: $(cat /home/sandbox/input.txt)\" > /tmp/output/result.txt\n"
+        )
+        status, result = request(
+            "POST",
+            "/execute",
+            {
+                "container_id": container_id,
+                "language": "bash",
+                "code": script,
+                "files": [{"name": "input.txt", "content": input_b64}],
+            },
+        )
+        assert status == 200, result
+        assert result["files"], result
+        decoded = base64.b64decode(result["files"][0]["content"]).decode("utf-8")
+        assert "Processed:" in decoded, result
+        print("   File flow OK")
+    finally:
+        print("6. Deleting container session...")
+        status, result = request("DELETE", f"/containers/{container_id}")
+        assert status == 200, result
+        print("   Cleanup OK")
+
 
 if __name__ == "__main__":
-    asyncio.run(test_flow())
+    main()

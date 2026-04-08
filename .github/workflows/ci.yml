@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  APP_ENV: development
+  REQUIRE_AUTH: "true"
+  METRICS_AUTH_REQUIRED: "true"
+  API_KEYS: ci:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  CORS_ALLOW_ORIGINS: https://ci.example.invalid
+  USE_DOCKER_DEFAULT_SECCOMP: "true"
+  SANDBOX_NETWORK_MODE: bridge
+  ALLOW_PIP_INSTALLS: "true"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Validate compose
+        run: docker compose config -q
+      - name: Install security tooling
+        run: python -m pip install --upgrade pip bandit pip-audit
+      - name: Install gateway test dependencies
+        run: python -m pip install -r gateway/requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall gateway sandbox verify_vm_flow.py verify_playwright.py verify_features.py test_execution.py test_gateway_unit.py
+      - name: Run unit tests
+        run: python -m unittest -q test_gateway_unit.py
+      - name: Run Bandit
+        run: bandit -q -r gateway sandbox
+      - name: Audit gateway dependencies
+        run: pip-audit -r gateway/requirements.txt
+      - name: Audit sandbox dependencies
+        run: pip-audit -r sandbox/requirements.txt
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build images
+        run: docker compose --profile local-docker build --pull
+      - name: Start stack
+        run: docker compose --profile local-docker up -d
+      - name: Wait for gateway
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS -H "Authorization: Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" http://localhost:8000/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose --profile local-docker logs
+          exit 1
+      - name: Smoke test container lifecycle
+        env:
+          API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        run: python3 verify_vm_flow.py
+      - name: Smoke test Playwright
+        env:
+          API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        run: python3 verify_playwright.py
+      - name: Run integration suite
+        env:
+          API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        run: python3 test_execution.py
+      - name: Scan gateway image
+        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
+        with:
+          image-ref: code-gateway:latest
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan sandbox image
+        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
+        with:
+          image-ref: code-sandbox:latest
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Shutdown stack
+        if: always()
+        run: docker compose --profile local-docker down --remove-orphans --volumes
