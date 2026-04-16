@@ -9,6 +9,7 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 
 
 def resolve_token() -> str | None:
+    """Resolve API token from environment variables."""
     for env_name in ("API_TOKEN", "API_KEY"):
         value = os.getenv(env_name)
         if value:
@@ -28,6 +29,7 @@ TOKEN = resolve_token()
 
 
 def request(method: str, path: str, payload: dict | None = None, timeout: int = 180):
+    """Make HTTP request to the gateway API."""
     data = None
     headers = {"Content-Type": "application/json"}
     if TOKEN:
@@ -49,6 +51,7 @@ def request(method: str, path: str, payload: dict | None = None, timeout: int = 
 
 
 def main():
+    """Verify Playwright functionality in the sandbox."""
     status, container = request("POST", "/containers", {"enable_network": True})
     assert status == 200, container
     container_id = container["container_id"]

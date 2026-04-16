@@ -26,15 +26,19 @@ class SessionInfo:
 
 class StateBackend:
     async def connect(self) -> None:
+        """Connect to the state backend."""
         return None
 
     async def close(self) -> None:
+        """Close the state backend connection."""
         return None
 
     async def health_check(self) -> bool:
+        """Check if the state backend is healthy."""
         return True
 
     async def get_session(self, container_id: str) -> Optional[SessionInfo]:
+        """Get session information by container ID."""
         raise NotImplementedError
 
     async def save_session(
@@ -44,6 +48,7 @@ class StateBackend:
         *,
         session_timeout_seconds: int,
     ) -> None:
+        """Save session information with timeout."""
         raise NotImplementedError
 
     async def touch_session(
@@ -52,18 +57,23 @@ class StateBackend:
         *,
         session_timeout_seconds: int,
     ) -> Optional[SessionInfo]:
+        """Update session last activity timestamp and return session info."""
         raise NotImplementedError
 
     async def delete_session(self, container_id: str) -> None:
+        """Delete session by container ID."""
         raise NotImplementedError
 
     async def list_sessions(self) -> dict[str, SessionInfo]:
+        """List all active sessions."""
         raise NotImplementedError
 
     async def count_sessions_total(self) -> int:
+        """Count total number of sessions."""
         return len(await self.list_sessions())
 
     async def count_sessions_for_owner(self, subject: str, tenant: Optional[str]) -> int:
+        """Count sessions for a specific owner."""
         sessions = await self.list_sessions()
         return sum(
             1
@@ -78,10 +88,12 @@ class StateBackend:
         limit: int,
         window_seconds: int,
     ) -> bool:
+        """Check if request is within rate limit for the bucket."""
         raise NotImplementedError
 
     @asynccontextmanager
     async def container_creation_guard(self, *, timeout_seconds: int) -> AsyncIterator[None]:
+        """Context manager to serialize container creation."""
         del timeout_seconds
         yield
 
@@ -89,12 +101,14 @@ class StateBackend:
     async def execution_lock(
         self, container_id: str, *, timeout_seconds: int
     ) -> AsyncIterator[None]:
+        """Context manager to serialize execution per container."""
         del container_id, timeout_seconds
         yield
 
 
 class InMemoryStateBackend(StateBackend):
     def __init__(self) -> None:
+        """Initialize in-memory state backend."""
         self.sessions: dict[str, SessionInfo] = {}
         self.rate_limit_state: Dict[str, Deque[float]] = {}
         self._lock = asyncio.Lock()
@@ -102,6 +116,7 @@ class InMemoryStateBackend(StateBackend):
         self._exec_locks: Dict[str, asyncio.Lock] = {}
 
     async def get_session(self, container_id: str) -> Optional[SessionInfo]:
+        """Get session from in-memory store."""
         return self.sessions.get(container_id)
 
     async def save_session(
@@ -111,6 +126,7 @@ class InMemoryStateBackend(StateBackend):
         *,
         session_timeout_seconds: int,
     ) -> None:
+        """Save session to in-memory store."""
         del session_timeout_seconds
         self.sessions[container_id] = session
 
@@ -120,6 +136,7 @@ class InMemoryStateBackend(StateBackend):
         *,
         session_timeout_seconds: int,
     ) -> Optional[SessionInfo]:
+        """Update session last activity in in-memory store."""
         del session_timeout_seconds
         session = self.sessions.get(container_id)
         if session is None:
@@ -128,10 +145,12 @@ class InMemoryStateBackend(StateBackend):
         return session
 
     async def delete_session(self, container_id: str) -> None:
+        """Delete session from in-memory store."""
         self.sessions.pop(container_id, None)
         self._exec_locks.pop(container_id, None)
 
     async def list_sessions(self) -> dict[str, SessionInfo]:
+        """List all sessions from in-memory store."""
         return dict(self.sessions)
 
     async def allow_within_rate_limit(
@@ -141,6 +160,7 @@ class InMemoryStateBackend(StateBackend):
         limit: int,
         window_seconds: int,
     ) -> bool:
+        """Check rate limit using in-memory sliding window."""
         if limit <= 0 or not bucket:
             return True
 
@@ -160,6 +180,7 @@ class InMemoryStateBackend(StateBackend):
 
     @asynccontextmanager
     async def container_creation_guard(self, *, timeout_seconds: int) -> AsyncIterator[None]:
+        """In-memory lock to serialize container creation."""
         try:
             await asyncio.wait_for(self._creation_lock.acquire(), timeout=timeout_seconds)
         except asyncio.TimeoutError as exc:
@@ -173,6 +194,7 @@ class InMemoryStateBackend(StateBackend):
     async def execution_lock(
         self, container_id: str, *, timeout_seconds: int
     ) -> AsyncIterator[None]:
+        """In-memory per-container lock to serialize execution."""
         lock = self._exec_locks.setdefault(container_id, asyncio.Lock())
         try:
             await asyncio.wait_for(lock.acquire(), timeout=timeout_seconds)
@@ -203,6 +225,7 @@ return 1
 """
 
     def __init__(self, redis_url: str) -> None:
+        """Initialize Redis state backend with connection URL."""
         self.client = redis_asyncio.from_url(
             redis_url,
             encoding="utf-8",
@@ -212,12 +235,15 @@ return 1
         self._creation_lock_key = "gateway:lock:container-create"
 
     async def connect(self) -> None:
+        """Connect to Redis and verify connection."""
         await self.client.ping()
 
     async def close(self) -> None:
+        """Close Redis connection."""
         await self.client.aclose()
 
     async def health_check(self) -> bool:
+        """Check if Redis connection is healthy."""
         try:
             await self.client.ping()
             return True
@@ -225,6 +251,7 @@ return 1
             return False
 
     async def get_session(self, container_id: str) -> Optional[SessionInfo]:
+        """Get session from Redis by container ID."""
         data = await self.client.hgetall(self._session_key(container_id))
         if not data:
             return None
@@ -237,6 +264,7 @@ return 1
         *,
         session_timeout_seconds: int,
     ) -> None:
+        """Save session to Redis with TTL."""
         ttl = session_timeout_seconds + SESSION_TTL_GRACE_SECONDS
         pipeline = self.client.pipeline()
         pipeline.hset(self._session_key(container_id), mapping=self._session_to_mapping(session))
@@ -250,6 +278,7 @@ return 1
         *,
         session_timeout_seconds: int,
     ) -> Optional[SessionInfo]:
+        """Update session last activity in Redis."""
         session = await self.get_session(container_id)
         if session is None:
             return None
@@ -263,12 +292,14 @@ return 1
         return session
 
     async def delete_session(self, container_id: str) -> None:
+        """Delete session from Redis."""
         pipeline = self.client.pipeline()
         pipeline.delete(self._session_key(container_id))
         pipeline.srem(self._session_index_key, container_id)
         await pipeline.execute()
 
     async def list_sessions(self) -> dict[str, SessionInfo]:
+        """List all sessions from Redis."""
         container_ids = sorted(await self.client.smembers(self._session_index_key))
         if not container_ids:
             return {}
@@ -298,6 +329,7 @@ return 1
         limit: int,
         window_seconds: int,
     ) -> bool:
+        """Check rate limit using Redis sorted set."""
         if limit <= 0 or not bucket:
             return True
 
@@ -315,6 +347,7 @@ return 1
 
     @asynccontextmanager
     async def container_creation_guard(self, *, timeout_seconds: int) -> AsyncIterator[None]:
+        """Redis-based lock to serialize container creation."""
         lock = self.client.lock(
             self._creation_lock_key,
             timeout=max(timeout_seconds + 5, 10),
@@ -335,6 +368,7 @@ return 1
     async def execution_lock(
         self, container_id: str, *, timeout_seconds: int
     ) -> AsyncIterator[None]:
+        """Redis-based per-container lock to serialize execution."""
         lock_key = f"gateway:lock:exec:{container_id}"
         lock = self.client.lock(
             lock_key,
@@ -354,6 +388,7 @@ return 1
 
     @staticmethod
     def _session_to_mapping(session: SessionInfo) -> dict[str, str]:
+        """Convert SessionInfo to dictionary for Redis storage."""
         return {
             "created_at": str(session.created_at),
             "last_activity": str(session.last_activity),
@@ -366,6 +401,7 @@ return 1
 
     @staticmethod
     def _session_from_mapping(mapping: dict[str, str]) -> SessionInfo:
+        """Convert Redis dictionary to SessionInfo."""
         return SessionInfo(
             created_at=float(mapping["created_at"]),
             last_activity=float(mapping["last_activity"]),
@@ -378,9 +414,11 @@ return 1
 
     @staticmethod
     def _session_key(container_id: str) -> str:
+        """Generate Redis key for session storage."""
         return f"gateway:session:{container_id}"
 
     @staticmethod
     def _rate_limit_key(bucket: str) -> str:
+        """Generate Redis key for rate limiting."""
         encoded = base64.urlsafe_b64encode(bucket.encode("utf-8")).decode("ascii")
         return f"gateway:rate:{encoded}"

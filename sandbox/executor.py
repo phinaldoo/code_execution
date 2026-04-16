@@ -38,6 +38,7 @@ RESULT_PREFIX = "__EXECUTOR_RESULT__:"
 
 
 def get_exec_timeout(default: int = 120) -> int:
+    """Get execution timeout from environment variable or return default."""
     raw_value = os.environ.get("EXEC_TIMEOUT", "").strip()
     if not raw_value:
         return default
@@ -197,6 +198,7 @@ def truncate_output(text: str, max_length: int = MAX_OUTPUT_LENGTH) -> str:
 
 
 def _list_residual_pids() -> list[int]:
+    """List residual process PIDs excluding PID 1 and current process."""
     current_pid = os.getpid()
     pids: list[int] = []
 
@@ -218,6 +220,7 @@ def _list_residual_pids() -> list[int]:
 
 
 def terminate_residual_processes() -> None:
+    """Terminate all residual processes except PID 1 and current process."""
     # NOTE: This kills ALL processes except PID 1 and ourselves. This is safe
     # because the gateway serializes execution per container (one exec at a time).
     residual_pids = _list_residual_pids()

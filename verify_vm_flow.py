@@ -10,6 +10,7 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 
 
 def resolve_token() -> str | None:
+    """Resolve API token from environment variables."""
     for env_name in ("API_TOKEN", "API_KEY"):
         value = os.getenv(env_name)
         if value:
@@ -29,6 +30,7 @@ TOKEN = resolve_token()
 
 
 def request(method: str, path: str, payload: dict | None = None, timeout: int = 60):
+    """Make HTTP request to the gateway API."""
     data = None
     headers = {"Content-Type": "application/json"}
     if TOKEN:
@@ -52,6 +54,7 @@ def request(method: str, path: str, payload: dict | None = None, timeout: int = 
 
 
 def main():
+    """Verify VM flow including health, container creation, and code execution."""
     print("1. Checking health...")
     status, payload = request("GET", "/healthz")
     assert status == 200, payload

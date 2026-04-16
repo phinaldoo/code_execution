@@ -9,6 +9,7 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 
 
 def resolve_token() -> str | None:
+    """Resolve API token from environment variables."""
     for env_name in ("API_TOKEN", "API_KEY"):
         value = os.getenv(env_name)
         if value:
@@ -28,6 +29,7 @@ TOKEN = resolve_token()
 
 
 def request(method: str, path: str, payload: dict | None = None, timeout: int = 90):
+    """Make HTTP request to the gateway API."""
     data = None
     headers = {"Content-Type": "application/json"}
     if TOKEN:
@@ -49,6 +51,7 @@ def request(method: str, path: str, payload: dict | None = None, timeout: int = 
 
 
 def execute(code: str, *, pip_packages: list[str] | None = None):
+    """Execute code in a container session and return result."""
     status, container = request("POST", "/containers", {"enable_network": True})
     assert status == 200, container
     container_id = container["container_id"]
@@ -69,6 +72,7 @@ def execute(code: str, *, pip_packages: list[str] | None = None):
 
 
 def test_no_auth():
+    """Test that requests without authentication are rejected."""
     print("Testing request without API key...")
     token = TOKEN
     if not token:
@@ -92,6 +96,7 @@ def test_no_auth():
 
 
 def test_good_auth():
+    """Test that authenticated requests succeed."""
     print("Testing authenticated execution...")
     status, result = execute("print('hello')")
     assert status == 200, result
@@ -100,6 +105,7 @@ def test_good_auth():
 
 
 def test_pip_packages():
+    """Test dynamic pip package installation."""
     print("Testing dynamic pip package installation...")
     code = "import cowsay; print(cowsay.get_output_string('cow', 'Moo!'))"
     status, result = execute(code, pip_packages=["cowsay"])

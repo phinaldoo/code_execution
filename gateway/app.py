@@ -36,12 +36,14 @@ from state import InMemoryStateBackend, RedisStateBackend, SessionInfo, StateBac
 
 
 def str_to_bool(value: Optional[str], default: bool = True) -> bool:
+    """Convert a string value to boolean, using default if value is None."""
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def split_csv(value: Optional[str]) -> list[str]:
+    """Split a CSV string into a list of non-empty, stripped items."""
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -140,6 +142,7 @@ class StaticApiKey:
 
 
 def parse_static_api_keys(values: list[str]) -> list[StaticApiKey]:
+    """Parse static API key strings into StaticApiKey objects, supporting optional key_id prefix."""
     keys: list[StaticApiKey] = []
     for idx, raw_value in enumerate(values):
         key_id = f"key-{idx + 1}"
@@ -209,6 +212,7 @@ metrics = {
 
 
 def auth_mode_summary() -> str:
+    """Return a summary string of enabled authentication modes."""
     modes: list[str] = []
     if JWT_SECRET:
         modes.append("jwt")
@@ -220,6 +224,7 @@ def auth_mode_summary() -> str:
 
 
 def docker_host_hostname(docker_host: str) -> Optional[str]:
+    """Extract the hostname from a Docker host URL string."""
     if not docker_host:
         return None
     parsed = urlparse(docker_host)
@@ -227,10 +232,12 @@ def docker_host_hostname(docker_host: str) -> Optional[str]:
 
 
 def principal_scope(auth: AuthContext) -> str:
+    """Generate a scope string for rate limiting based on subject and tenant."""
     return f"{auth.subject}:{auth.tenant or '-'}"
 
 
 def validate_runtime_configuration() -> None:
+    """Validate runtime configuration settings and raise RuntimeError if invalid."""
     if DEFAULT_TIMEOUT > MAX_TIMEOUT:
         raise RuntimeError("DEFAULT_TIMEOUT must be less than or equal to MAX_TIMEOUT")
 
@@ -316,6 +323,7 @@ def validate_runtime_configuration() -> None:
 
 
 def decode_jwt_token(token: str) -> AuthContext:
+    """Decode and validate a JWT token, returning AuthContext with subject and tenant."""
     decode_kwargs = {
         "algorithms": JWT_ALGORITHMS,
         "options": {"require": ["exp", "sub"]},
@@ -332,6 +340,7 @@ def decode_jwt_token(token: str) -> AuthContext:
 
 
 def decode_static_api_key(token: str) -> Optional[AuthContext]:
+    """Validate a static API key against configured keys, returning AuthContext if valid."""
     for api_key in STATIC_API_KEYS:
         if secrets.compare_digest(token, api_key.secret):
             return AuthContext(
@@ -347,6 +356,7 @@ def authenticate_credentials(
     *,
     required: bool,
 ) -> AuthContext:
+    """Authenticate credentials using JWT or static API key, returning AuthContext."""
     if not required:
         return AuthContext(subject="anonymous", tenant=None, auth_type="none")
 
@@ -387,18 +397,21 @@ security = HTTPBearer(auto_error=False)
 def verify_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> AuthContext:
+    """FastAPI dependency to verify authentication credentials."""
     return authenticate_credentials(credentials, required=REQUIRE_AUTH)
 
 
 def verify_metrics_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Optional[AuthContext]:
+    """FastAPI dependency to verify authentication for metrics endpoint."""
     if not METRICS_AUTH_REQUIRED:
         return None
     return authenticate_credentials(credentials, required=True)
 
 
 def infer_network_enabled(container: docker.models.containers.Container) -> bool:
+    """Infer whether network is enabled for a container from its configuration."""
     try:
         host_cfg = container.attrs.get("HostConfig", {})
         network_mode = host_cfg.get("NetworkMode", SANDBOX_NETWORK_MODE)
@@ -408,6 +421,7 @@ def infer_network_enabled(container: docker.models.containers.Container) -> bool
 
 
 def session_is_local(session: SessionInfo) -> bool:
+    """Check if a session belongs to the local Docker daemon."""
     if not session.docker_daemon_id:
         return True
     if not local_docker_daemon_id:
@@ -416,6 +430,7 @@ def session_is_local(session: SessionInfo) -> bool:
 
 
 def enforce_session_daemon_affinity(session: SessionInfo) -> None:
+    """Raise HTTPException if session belongs to a different Docker daemon."""
     if session_is_local(session):
         return
     raise HTTPException(
@@ -428,6 +443,7 @@ def enforce_session_daemon_affinity(session: SessionInfo) -> None:
 
 
 def recover_session_info(container: docker.models.containers.Container) -> SessionInfo:
+    """Recover session information from a container's labels and attributes."""
     labels = container.labels or {}
     now = time.time()
     created_at = now
@@ -449,6 +465,7 @@ def recover_session_info(container: docker.models.containers.Container) -> Sessi
 
 
 async def touch_session(container_id: str) -> Optional[SessionInfo]:
+    """Update session last activity timestamp and return session info."""
     return await state_backend.touch_session(
         container_id,
         session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
@@ -456,6 +473,7 @@ async def touch_session(container_id: str) -> Optional[SessionInfo]:
 
 
 async def ensure_session_access(container_id: str, auth: AuthContext) -> SessionInfo:
+    """Ensure the authenticated user has access to the container session."""
     session = await state_backend.get_session(container_id)
     if session is None:
         try:
@@ -497,6 +515,7 @@ async def enforce_rate_limit(
     window_seconds: int,
     message: str,
 ) -> None:
+    """Enforce rate limit and raise HTTPException if exceeded."""
     allowed = await state_backend.allow_within_rate_limit(
         key,
         limit=limit,
@@ -507,6 +526,7 @@ async def enforce_rate_limit(
 
 
 async def enforce_container_creation_limits(auth: AuthContext) -> None:
+    """Enforce limits on total containers and containers per principal."""
     sessions = await state_backend.list_sessions()
     total_sessions = len(sessions)
     owner_sessions = sum(
@@ -535,6 +555,7 @@ async def remove_container(
     reason: str = "cleanup",
     container: Optional[docker.models.containers.Container] = None,
 ) -> None:
+    """Remove a container and clean up its session state."""
     prefix = f"[{execution_id}] " if execution_id else ""
     if container is None:
         session = await state_backend.get_session(container_id)
@@ -580,6 +601,7 @@ async def remove_container(
 
 
 async def cleanup_idle_containers() -> None:
+    """Background task to clean up idle containers and recover untracked containers."""
     while True:
         try:
             now = time.time()
@@ -620,6 +642,7 @@ async def cleanup_idle_containers() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """FastAPI lifespan context manager for startup and shutdown."""
     global docker_client, execution_semaphore, state_backend, local_docker_daemon_id, local_docker_daemon_name
 
     validate_runtime_configuration()
@@ -712,6 +735,7 @@ if ENABLE_CORS and CORS_ALLOW_ORIGINS:
 
 @app.middleware("http")
 async def request_metrics_middleware(request: Request, call_next):
+    """Middleware to track request metrics and add request ID to responses."""
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = request_id
     start = time.monotonic()
@@ -845,6 +869,7 @@ class CreateContainerRequest(BaseModel):
 
 
 def _read_env_source_bytes() -> Optional[bytes]:
+    """Read the sandbox environment source file bytes for injection."""
     if not SANDBOX_ENV_SOURCE_PATH:
         return None
 
@@ -859,6 +884,7 @@ def _read_env_source_bytes() -> Optional[bytes]:
 
 
 def create_tar_archive_from_files(files: list[PreparedFile]) -> bytes:
+    """Create a tar archive from a list of prepared files."""
     import tarfile
     from io import BytesIO
 
@@ -873,6 +899,7 @@ def create_tar_archive_from_files(files: list[PreparedFile]) -> bytes:
 
 
 def prepare_files(files: list[FileInput]) -> list[PreparedFile]:
+    """Validate and decode base64-encoded file inputs, returning prepared files."""
     prepared: list[PreparedFile] = []
     total_size = 0
 
@@ -910,6 +937,7 @@ async def ensure_sandbox_env_file(
     execution_id: str,
     inject_sandbox_env: bool,
 ) -> None:
+    """Ensure the sandbox environment file is injected into the container if requested."""
     if not inject_sandbox_env:
         return
 
@@ -930,6 +958,7 @@ async def ensure_sandbox_env_file(
 
 
 def build_tmpfs_config() -> dict[str, str]:
+    """Build tmpfs mount configuration for sandbox container."""
     owner = f"uid={SANDBOX_UID},gid={SANDBOX_GID}"
     return {
         "/home/sandbox": f"size={SANDBOX_HOME_TMPFS_SIZE},mode=0700,{owner}",
@@ -945,6 +974,7 @@ async def create_container_session(
     auth: AuthContext,
     inject_sandbox_env: bool,
 ) -> str:
+    """Create a new sandbox container session and return its ID."""
     if not local_docker_daemon_id:
         raise RuntimeError("Docker daemon identity is unavailable; refusing to create a sandbox session.")
 
@@ -1046,6 +1076,7 @@ async def run_exec_with_timeout(
     timeout: int,
     execution_id: str,
 ) -> tuple[str, int, bool]:
+    """Run a Docker exec with timeout, returning (output, exit_code, timed_out)."""
     exec_task = asyncio.create_task(asyncio.to_thread(docker_client.api.exec_start, exec_id))
 
     try:
@@ -1077,6 +1108,7 @@ async def run_code_in_sandbox(
     pip_packages: Optional[list[str]] = None,
     files: Optional[list[FileInput]] = None,
 ) -> ExecuteResponse:
+    """Execute code in a sandbox container and return the execution response."""
     session = await state_backend.get_session(container_id)
     if not session:
         raise HTTPException(
@@ -1233,6 +1265,7 @@ async def create_container(
     request: Optional[CreateContainerRequest] = None,
     auth: AuthContext = Depends(verify_auth),
 ):
+    """Create a new sandbox container session."""
     enable_network = request.enable_network if request else True
     inject_sandbox_env = request.inject_sandbox_env if request else False
     if inject_sandbox_env and not ALLOW_SANDBOX_ENV_INJECTION:
@@ -1284,6 +1317,7 @@ async def create_container(
 
 @app.get("/containers/{container_id}", response_model=ContainerResponse)
 async def get_container(container_id: str, auth: AuthContext = Depends(verify_auth)):
+    """Get information about a container session."""
     session = await ensure_session_access(container_id, auth)
 
     try:
@@ -1303,6 +1337,7 @@ async def get_container(container_id: str, auth: AuthContext = Depends(verify_au
 
 @app.delete("/containers/{container_id}")
 async def delete_container(container_id: str, auth: AuthContext = Depends(verify_auth)):
+    """Delete a container session."""
     await ensure_session_access(container_id, auth)
     await remove_container(container_id, reason="client-delete")
     return {"status": "success", "message": f"Container {container_id} removed."}
@@ -1310,6 +1345,7 @@ async def delete_container(container_id: str, auth: AuthContext = Depends(verify
 
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute_code(request: ExecuteRequest, auth: AuthContext = Depends(verify_auth)):
+    """Execute code in a container session."""
     session = await ensure_session_access(request.container_id, auth)
     timeout = request.timeout or DEFAULT_TIMEOUT
     execution_id = str(uuid.uuid4())[:12]
@@ -1401,6 +1437,7 @@ async def execute_code(request: ExecuteRequest, auth: AuthContext = Depends(veri
 
 
 async def build_health_payload() -> tuple[bool, dict]:
+    """Build health check payload with Docker and state backend status."""
     try:
         await asyncio.to_thread(docker_client.ping)
         docker_ok = True
@@ -1438,6 +1475,7 @@ async def build_health_payload() -> tuple[bool, dict]:
 @app.get("/health")
 @app.get("/healthz")
 async def health_check():
+    """Simple health check endpoint returning service status."""
     healthy, payload = await build_health_payload()
     return JSONResponse(
         status_code=200 if healthy else 503,
@@ -1448,6 +1486,7 @@ async def health_check():
 @app.get("/health/details")
 @app.get("/healthz/details")
 async def health_check_details(_auth: AuthContext = Depends(verify_auth)):
+    """Detailed health check endpoint returning full service status."""
     healthy, payload = await build_health_payload()
     return JSONResponse(
         status_code=200 if healthy else 503,
@@ -1457,11 +1496,13 @@ async def health_check_details(_auth: AuthContext = Depends(verify_auth)):
 
 @app.get("/metrics")
 async def get_metrics(_auth: Optional[AuthContext] = Depends(verify_metrics_auth)):
+    """Prometheus metrics endpoint."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/metrics/json")
 async def get_metrics_json(auth: AuthContext = Depends(verify_auth)):
+    """JSON metrics endpoint for debugging."""
     return {
         "_note": "replica-local counters; use /metrics (Prometheus) for cluster-wide aggregation",
         **metrics,
@@ -1470,6 +1511,7 @@ async def get_metrics_json(auth: AuthContext = Depends(verify_auth)):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler to log errors and return 500 response."""
     logger.error(
         "[%s] Unhandled exception: %s",
         getattr(request.state, "request_id", "-"),

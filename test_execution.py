@@ -26,6 +26,7 @@ BOLD = "\033[1m"
 
 
 def resolve_token() -> str | None:
+    """Resolve API token from environment variables."""
     for env_name in ("API_TOKEN", "API_KEY"):
         value = os.getenv(env_name)
         if value:
@@ -45,6 +46,7 @@ TOKEN = resolve_token()
 
 
 def request(method: str, path: str, payload: dict | None = None, timeout: int = 90) -> tuple[int, dict]:
+    """Make HTTP request to the gateway API."""
     data = None
     headers = {"Content-Type": "application/json"}
     if TOKEN:
@@ -69,6 +71,7 @@ def request(method: str, path: str, payload: dict | None = None, timeout: int = 
 
 
 def execute(code: str, timeout: int = 30, enable_network: bool = True, language: str = "python") -> dict:
+    """Execute code in a container session and return result."""
     status, container = request("POST", "/containers", {"enable_network": enable_network}, timeout=30)
     if status != 200:
         return {"error": f"Failed to create container: {container}", "error_type": "SetupError"}
@@ -95,6 +98,7 @@ def execute(code: str, timeout: int = 30, enable_network: bool = True, language:
 
 
 def test_health():
+    """Test basic health check endpoint."""
     status, data = request("GET", "/healthz", timeout=10)
     assert status == 200, data
     assert data["status"] == "healthy", f"Service unhealthy: {data}"
@@ -102,6 +106,7 @@ def test_health():
 
 
 def test_health_details():
+    """Test detailed health check endpoint."""
     status, data = request("GET", "/healthz/details", timeout=10)
     assert status == 200, data
     assert data["status"] == "healthy", f"Detailed health check failed: {data}"
@@ -111,6 +116,7 @@ def test_health_details():
 
 
 def test_simple_print():
+    """Test simple print statement execution."""
     result = execute('print("Hello, World!")')
     assert result.get("stdout", "").strip() == "Hello, World!", f"Unexpected stdout: {result}"
     assert result.get("error") is None, f"Unexpected error: {result.get('error')}"
@@ -118,6 +124,7 @@ def test_simple_print():
 
 
 def test_math():
+    """Test mathematical computation."""
     code = """
 import math
 result = math.factorial(20)
@@ -130,6 +137,7 @@ print(f"20! = {result}")
 
 
 def test_matplotlib_plot():
+    """Test matplotlib plot generation."""
     code = """
 import matplotlib.pyplot as plt
 import numpy as np
@@ -155,6 +163,7 @@ plt.show()
 
 
 def test_syntax_error():
+    """Test syntax error handling."""
     result = execute("def foo(\n  broken")
     assert result.get("error") is not None, "Expected an error"
     assert "SyntaxError" in (result.get("error_type", "") or result.get("error", ""))
@@ -162,6 +171,7 @@ def test_syntax_error():
 
 
 def test_runtime_error():
+    """Test runtime error handling."""
     result = execute("x = 1 / 0")
     assert result.get("error") is not None, "Expected an error"
     assert "ZeroDivision" in (result.get("error_type", "") or result.get("error", ""))
@@ -169,6 +179,7 @@ def test_runtime_error():
 
 
 def test_timeout():
+    """Test execution timeout enforcement."""
     code = """
 import time
 time.sleep(60)
@@ -180,6 +191,7 @@ print("Should not reach here")
 
 
 def test_multiple_files():
+    """Test multiple file output generation."""
     code = """
 import matplotlib.pyplot as plt
 import numpy as np
@@ -211,6 +223,7 @@ print("Generated 2 plots and 1 CSV")
 
 
 def test_pandas_numpy():
+    """Test pandas and numpy functionality."""
     code = """
 import pandas as pd
 import numpy as np
@@ -229,6 +242,7 @@ print(f"Shape: {df.shape}")
 
 
 def test_network_access():
+    """Test network access from sandbox."""
     code = """
 import requests
 resp = requests.get("https://httpbin.org/get", timeout=10)
@@ -241,6 +255,7 @@ print(f"Status: {resp.status_code}")
 
 
 def test_background_process_cleanup():
+    """Test cleanup of background processes between executions."""
     status, container = request("POST", "/containers", {"enable_network": False}, timeout=30)
     assert status == 200, container
 
@@ -304,6 +319,7 @@ TESTS = [
 
 
 def main():
+    """Main entry point for running integration tests."""
     parser = argparse.ArgumentParser(description="Test the Code Execution Service")
     parser.add_argument("--url", default="http://localhost:8000", help="Service URL")
     args = parser.parse_args()
