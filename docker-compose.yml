@@ -12,7 +12,7 @@ services:
   docker-proxy:
     profiles:
       - local-docker
-    image: ghcr.io/tecnativa/docker-socket-proxy:0.4.2
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.4.1
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -45,10 +45,11 @@ services:
 
   redis:
     image: redis:7.4.2-alpine
+    user: "999:999"
     restart: unless-stopped
     command: [ "redis-server", "--save", "", "--appendonly", "no" ]
     tmpfs:
-      - /data:rw,noexec,nosuid,nodev,size=64m
+      - /data:rw,noexec,nosuid,nodev,size=64m,uid=999,gid=999,mode=0750
     cap_drop:
       - ALL
     security_opt:
@@ -110,6 +111,7 @@ services:
       - SANDBOX_MISC_TMPFS_SIZE=${SANDBOX_MISC_TMPFS_SIZE:-128m}
       - SANDBOX_SHM_SIZE=${SANDBOX_SHM_SIZE:-128m}
       - SANDBOX_HOME_TMPFS_SIZE=${SANDBOX_HOME_TMPFS_SIZE:-256m}
+      - SANDBOX_READ_ONLY_ROOTFS=${SANDBOX_READ_ONLY_ROOTFS:-false}
       - SANDBOX_NETWORK_MODE=${SANDBOX_NETWORK_MODE:-none}
       - SANDBOX_UID=${SANDBOX_UID:-10001}
       - SANDBOX_GID=${SANDBOX_GID:-10001}

@@ -1,63 +1,21 @@
 #!/usr/bin/env python3
-import json
-import os
 import urllib.error
 import urllib.request
 
-
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-
-
-def resolve_token() -> str | None:
-    """Resolve API token from environment variables."""
-    for env_name in ("API_TOKEN", "API_KEY"):
-        value = os.getenv(env_name)
-        if value:
-            return value
-
-    api_keys = os.getenv("API_KEYS", "")
-    if not api_keys:
-        return None
-
-    first = api_keys.split(",", 1)[0].strip()
-    if ":" in first:
-        return first.split(":", 1)[1]
-    return first or None
+from verification_client import GatewayClient, env_flag
 
 
-TOKEN = resolve_token()
-
-
-def request(method: str, path: str, payload: dict | None = None, timeout: int = 90):
-    """Make HTTP request to the gateway API."""
-    data = None
-    headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        data=data,
-        headers=headers,
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
+CLIENT = GatewayClient.from_environment()
 
 
 def execute(code: str, *, pip_packages: list[str] | None = None):
     """Execute code in a container session and return result."""
-    status, container = request("POST", "/containers", {"enable_network": True})
+    status, container = CLIENT.request("POST", "/containers", {"enable_network": True})
     assert status == 200, container
     container_id = container["container_id"]
 
     try:
-        return request(
+        return CLIENT.request(
             "POST",
             "/execute",
             {
@@ -68,19 +26,19 @@ def execute(code: str, *, pip_packages: list[str] | None = None):
             },
         )
     finally:
-        request("DELETE", f"/containers/{container_id}")
+        CLIENT.request("DELETE", f"/containers/{container_id}")
 
 
 def test_no_auth():
     """Test that requests without authentication are rejected."""
     print("Testing request without API key...")
-    token = TOKEN
+    token = CLIENT.token
     if not token:
         print("  Skipping because no bearer token is configured for this environment.")
         return
 
     req = urllib.request.Request(
-        f"{BASE_URL}/containers",
+        f"{CLIENT.base_url}/containers",
         data=b"{}",
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -107,6 +65,9 @@ def test_good_auth():
 def test_pip_packages():
     """Test dynamic pip package installation."""
     print("Testing dynamic pip package installation...")
+    if not env_flag("ALLOW_PIP_INSTALLS", default=False):
+        print("  Skipping because ALLOW_PIP_INSTALLS is disabled in this environment.")
+        return
     code = "import cowsay; print(cowsay.get_output_string('cow', 'Moo!'))"
     status, result = execute(code, pip_packages=["cowsay"])
     assert status == 200, result

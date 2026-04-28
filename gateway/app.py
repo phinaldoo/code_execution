@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Any, Literal, NamedTuple, Optional
 from urllib.parse import urlparse
 
 import docker
@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 from state import InMemoryStateBackend, RedisStateBackend, SessionInfo, StateBackend
 
@@ -65,6 +65,7 @@ SANDBOX_MPL_CACHE_TMPFS_SIZE = os.getenv("SANDBOX_MPL_CACHE_TMPFS_SIZE", "32m")
 SANDBOX_MISC_TMPFS_SIZE = os.getenv("SANDBOX_MISC_TMPFS_SIZE", "128m")
 SANDBOX_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "128m")
 SANDBOX_HOME_TMPFS_SIZE = os.getenv("SANDBOX_HOME_TMPFS_SIZE", "256m")
+SANDBOX_READ_ONLY_ROOTFS = str_to_bool(os.getenv("SANDBOX_READ_ONLY_ROOTFS", "false"))
 SANDBOX_NETWORK_MODE = os.getenv("SANDBOX_NETWORK_MODE", "none")
 SANDBOX_UID = int(os.getenv("SANDBOX_UID", "10001"))
 SANDBOX_GID = int(os.getenv("SANDBOX_GID", "10001"))
@@ -169,6 +170,10 @@ class AuthContext:
 class PreparedFile(NamedTuple):
     name: str
     content: bytes
+
+
+class ExecutorOutputError(ValueError):
+    """Raised when the sandbox executor output cannot be parsed safely."""
 
 
 execution_semaphore: asyncio.Semaphore
@@ -693,12 +698,13 @@ async def lifespan(app: FastAPI):
         logger.warning("Failed to recover existing containers: %s", exc)
 
     logger.info(
-        "Gateway started env=%s auth=%s max_concurrent=%s default_timeout=%ss network=%s docker_default_seccomp=%s state_backend=%s docker_daemon_id=%s",
+        "Gateway started env=%s auth=%s max_concurrent=%s default_timeout=%ss network=%s read_only_rootfs=%s docker_default_seccomp=%s state_backend=%s docker_daemon_id=%s",
         APP_ENV,
         auth_mode_summary(),
         MAX_CONCURRENT,
         DEFAULT_TIMEOUT,
         SANDBOX_NETWORK_MODE,
+        SANDBOX_READ_ONLY_ROOTFS,
         USE_DOCKER_DEFAULT_SECCOMP,
         type(state_backend).__name__,
         local_docker_daemon_id or "-",
@@ -773,14 +779,15 @@ class FileInput(BaseModel):
     name: str = Field(..., description="File name including extension")
     content: str = Field(..., description="Base64 encoded content of the file")
 
-    @validator("name")
+    @field_validator("name")
+    @classmethod
     def validate_name(cls, value: str) -> str:
         sanitized = value.strip()
         if not sanitized:
             raise ValueError("File name cannot be empty")
         if len(sanitized) > MAX_FILE_NAME_LENGTH:
             raise ValueError(f"File name too long (max {MAX_FILE_NAME_LENGTH} chars)")
-        if ".." in sanitized or sanitized.startswith(("/", "\\")):
+        if ".." in sanitized or sanitized.startswith(("/", "\\")) or "\\" in sanitized:
             raise ValueError("File name contains invalid path segments")
         if any(part in {"", ".", ".."} for part in sanitized.split("/")):
             raise ValueError("File name contains invalid components")
@@ -789,7 +796,10 @@ class FileInput(BaseModel):
 
 class ExecuteRequest(BaseModel):
     container_id: str = Field(..., description="The ID of the active container session")
-    language: str = Field("python", description="Language to execute (python or bash)")
+    language: Literal["python", "bash"] = Field(
+        "python",
+        description="Language to execute (python or bash)",
+    )
     code: str = Field(..., description="Code to execute", min_length=1, max_length=100_000)
     timeout: Optional[int] = Field(
         default=None,
@@ -810,26 +820,35 @@ class ExecuteRequest(BaseModel):
         description="Input files to copy to the container before executing",
     )
 
-    @validator("pip_packages", each_item=True)
-    def validate_pip_package(cls, pkg: str) -> str:
-        name = pkg.strip()
-        if not name:
-            raise ValueError("Package name cannot be empty")
-        if len(name) > MAX_PIP_PACKAGE_NAME_LENGTH:
-            raise ValueError(f"Package name too long (max {MAX_PIP_PACKAGE_NAME_LENGTH} chars)")
-        if not PIP_PACKAGE_PATTERN.match(name):
-            raise ValueError("Package name contains invalid characters")
-        return name
+    @field_validator("pip_packages", mode="before")
+    @classmethod
+    def validate_pip_packages_input(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        return value
 
-    @validator("pip_packages")
+    @field_validator("pip_packages")
+    @classmethod
     def validate_pip_package_list(cls, packages: list[str]) -> list[str]:
-        if not ALLOW_PIP_INSTALLS and packages:
-            raise ValueError("Pip installations are disabled")
-        if len(packages) > MAX_PIP_PACKAGES:
-            raise ValueError(f"Too many pip packages (max {MAX_PIP_PACKAGES})")
-        return packages
+        normalized: list[str] = []
+        for pkg in packages:
+            name = pkg.strip()
+            if not name:
+                raise ValueError("Package name cannot be empty")
+            if len(name) > MAX_PIP_PACKAGE_NAME_LENGTH:
+                raise ValueError(f"Package name too long (max {MAX_PIP_PACKAGE_NAME_LENGTH} chars)")
+            if not PIP_PACKAGE_PATTERN.match(name):
+                raise ValueError("Package name contains invalid characters")
+            normalized.append(name)
 
-    @validator("files")
+        if not ALLOW_PIP_INSTALLS and normalized:
+            raise ValueError("Pip installations are disabled")
+        if len(normalized) > MAX_PIP_PACKAGES:
+            raise ValueError(f"Too many pip packages (max {MAX_PIP_PACKAGES})")
+        return normalized
+
+    @field_validator("files")
+    @classmethod
     def validate_file_count(cls, files: list[FileInput]) -> list[FileInput]:
         if len(files) > MAX_INPUT_FILES:
             raise ValueError(f"Too many input files (max {MAX_INPUT_FILES})")
@@ -860,12 +879,61 @@ class ExecuteResponse(BaseModel):
     error_type: Optional[str] = None
     files: list[FileOutput] = Field(default_factory=list)
     execution_time: float
+    install_time: Optional[float] = None
     timed_out: bool = False
 
 
 class CreateContainerRequest(BaseModel):
     enable_network: bool = True
     inject_sandbox_env: bool = False
+
+
+def build_execution_error_response(
+    *,
+    execution_id: str,
+    error: str,
+    error_type: str,
+    execution_time: float = 0,
+    timed_out: bool = False,
+) -> ExecuteResponse:
+    """Construct a consistent execution error response."""
+    return ExecuteResponse(
+        execution_id=execution_id,
+        stdout="",
+        stderr="",
+        error=error,
+        error_type=error_type,
+        execution_time=execution_time,
+        timed_out=timed_out,
+    )
+
+
+def parse_executor_result(raw_output: str) -> dict[str, Any]:
+    """Parse the structured executor payload from Docker exec output."""
+    lines = [line.strip() for line in raw_output.strip().splitlines() if line.strip()]
+    if not lines:
+        raise ExecutorOutputError("Executor returned no output")
+
+    for line in reversed(lines):
+        if not line.startswith(EXECUTOR_RESULT_PREFIX):
+            continue
+        payload = line[len(EXECUTOR_RESULT_PREFIX) :].strip()
+        if not payload:
+            continue
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+    for line in reversed(lines):
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+    raise ExecutorOutputError("No structured JSON payload found in executor output")
 
 
 def _read_env_source_bytes() -> Optional[bytes]:
@@ -902,11 +970,19 @@ def prepare_files(files: list[FileInput]) -> list[PreparedFile]:
     """Validate and decode base64-encoded file inputs, returning prepared files."""
     prepared: list[PreparedFile] = []
     total_size = 0
+    seen_names: set[str] = set()
 
     for file in files:
+        if file.name in seen_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate input file name '{file.name}' is not allowed",
+            )
+        seen_names.add(file.name)
+
         try:
-            content_bytes = base64.b64decode(file.content)
-        except binascii.Error as exc:
+            content_bytes = base64.b64decode(file.content, validate=True)
+        except (binascii.Error, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"File '{file.name}' content is not valid base64",
@@ -934,7 +1010,6 @@ def prepare_files(files: list[FileInput]) -> list[PreparedFile]:
 async def ensure_sandbox_env_file(
     container: docker.models.containers.Container,
     *,
-    execution_id: str,
     inject_sandbox_env: bool,
 ) -> None:
     """Ensure the sandbox environment file is injected into the container if requested."""
@@ -1014,7 +1089,8 @@ async def create_container_session(
             "inject-sandbox-env": "1" if inject_sandbox_env else "0",
         },
         "name": f"sandbox-{execution_id}",
-        "read_only": True,
+        # Docker archive uploads for input files and `.env` injection require a writable rootfs.
+        "read_only": SANDBOX_READ_ONLY_ROOTFS,
         "security_opt": security_opts,
         "user": f"{SANDBOX_UID}:{SANDBOX_GID}",
         "working_dir": "/home/sandbox",
@@ -1029,7 +1105,6 @@ async def create_container_session(
     try:
         await ensure_sandbox_env_file(
             container,
-            execution_id=execution_id,
             inject_sandbox_env=inject_sandbox_env,
         )
     except Exception:
@@ -1126,18 +1201,14 @@ async def run_code_in_sandbox(
     try:
         await ensure_sandbox_env_file(
             container,
-            execution_id=execution_id,
             inject_sandbox_env=session.inject_sandbox_env,
         )
     except Exception as exc:
         logger.error("[%s] Failed to provision sandbox env file: %s", execution_id, exc)
-        return ExecuteResponse(
+        return build_execution_error_response(
             execution_id=execution_id,
-            stdout="",
-            stderr="",
             error=str(exc),
             error_type="EnvironmentProvisionError",
-            execution_time=0,
         )
 
     code_b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
@@ -1149,13 +1220,10 @@ async def run_code_in_sandbox(
             await asyncio.to_thread(container.put_archive, "/home/sandbox", tar_data)
         except Exception as exc:
             logger.error("[%s] Failed to upload files: %s", execution_id, exc)
-            return ExecuteResponse(
+            return build_execution_error_response(
                 execution_id=execution_id,
-                stdout="",
-                stderr="",
                 error=f"Failed to copy input files to container: {exc}",
                 error_type="FileUploadError",
-                execution_time=0,
             )
 
     environment = {
@@ -1185,10 +1253,8 @@ async def run_code_in_sandbox(
         )
 
         if timed_out:
-            return ExecuteResponse(
+            return build_execution_error_response(
                 execution_id=execution_id,
-                stdout="",
-                stderr="",
                 error=f"Execution timed out after {timeout} seconds. Container removed.",
                 error_type="TimeoutError",
                 execution_time=float(timeout),
@@ -1196,33 +1262,7 @@ async def run_code_in_sandbox(
             )
 
         try:
-            result_data = None
-            lines = [line.strip() for line in raw_output.strip().splitlines() if line.strip()]
-
-            for line in reversed(lines):
-                if not line.startswith(EXECUTOR_RESULT_PREFIX):
-                    continue
-                payload = line[len(EXECUTOR_RESULT_PREFIX) :].strip()
-                if not payload:
-                    continue
-                try:
-                    result_data = json.loads(payload)
-                    break
-                except json.JSONDecodeError:
-                    continue
-
-            if result_data is None:
-                for line in reversed(lines):
-                    if not (line.startswith("{") and line.endswith("}")):
-                        continue
-                    try:
-                        result_data = json.loads(line)
-                        break
-                    except json.JSONDecodeError:
-                        continue
-
-            if result_data is None:
-                raise ValueError("No JSON output found from executor")
+            result_data = parse_executor_result(raw_output)
 
             await touch_session(container_id)
 
@@ -1234,29 +1274,24 @@ async def run_code_in_sandbox(
                 error_type=result_data.get("error_type"),
                 files=[FileOutput(**item) for item in result_data.get("files", [])],
                 execution_time=float(result_data.get("execution_time", 0)),
+                install_time=result_data.get("install_time"),
                 timed_out=False,
             )
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (ExecutorOutputError, TypeError, ValueError) as exc:
             logger.error("[%s] Failed to parse executor output: %s", execution_id, exc)
             logger.debug("[%s] Raw executor output: %s", execution_id, raw_output[:2000] if raw_output else "")
-            return ExecuteResponse(
+            return build_execution_error_response(
                 execution_id=execution_id,
-                stdout="",
-                stderr="",
                 error="Failed to parse executor output",
                 error_type="GatewayError",
-                execution_time=0,
             )
 
     except docker.errors.APIError as exc:
         logger.error("[%s] Docker API error: %s", execution_id, exc)
-        return ExecuteResponse(
+        return build_execution_error_response(
             execution_id=execution_id,
-            stdout="",
-            stderr="",
             error="Execution failed due to an infrastructure error",
             error_type="GatewayError",
-            execution_time=0,
         )
 
 

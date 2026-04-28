@@ -1,58 +1,13 @@
 #!/usr/bin/env python3
-import json
-import os
-import urllib.error
-import urllib.request
+from verification_client import GatewayClient
 
 
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-
-
-def resolve_token() -> str | None:
-    """Resolve API token from environment variables."""
-    for env_name in ("API_TOKEN", "API_KEY"):
-        value = os.getenv(env_name)
-        if value:
-            return value
-
-    api_keys = os.getenv("API_KEYS", "")
-    if not api_keys:
-        return None
-
-    first = api_keys.split(",", 1)[0].strip()
-    if ":" in first:
-        return first.split(":", 1)[1]
-    return first or None
-
-
-TOKEN = resolve_token()
-
-
-def request(method: str, path: str, payload: dict | None = None, timeout: int = 180):
-    """Make HTTP request to the gateway API."""
-    data = None
-    headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        data=data,
-        headers=headers,
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
+CLIENT = GatewayClient.from_environment()
 
 
 def main():
     """Verify Playwright functionality in the sandbox."""
-    status, container = request("POST", "/containers", {"enable_network": True})
+    status, container = CLIENT.request("POST", "/containers", {"enable_network": True}, timeout=180)
     assert status == 200, container
     container_id = container["container_id"]
 
@@ -62,14 +17,18 @@ from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     page = browser.new_page(viewport={"width": 1280, "height": 720})
-    page.goto("https://example.com", wait_until="domcontentloaded")
+    page.set_content(
+        "<html><head><title>Sandbox Playwright Check</title></head>"
+        "<body><main><h1>Playwright OK</h1><p>Local render verification.</p></main></body></html>",
+        wait_until="domcontentloaded",
+    )
     page.screenshot(path="/tmp/output/playwright-example.png", full_page=True)
     print(page.title())
     browser.close()
 """
 
     try:
-        status, result = request(
+        status, result = CLIENT.request(
             "POST",
             "/execute",
             {
@@ -81,10 +40,11 @@ with sync_playwright() as p:
         )
         assert status == 200, result
         assert not result.get("error"), result
+        assert "Sandbox Playwright Check" in result.get("stdout", ""), result
         assert any(file["name"] == "playwright-example.png" for file in result.get("files", [])), result
         print("Playwright verification passed.")
     finally:
-        request("DELETE", f"/containers/{container_id}")
+        CLIENT.request("DELETE", f"/containers/{container_id}", timeout=180)
 
 
 if __name__ == "__main__":

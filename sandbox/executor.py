@@ -3,7 +3,7 @@
 Secure Python Code Executor for LLM Sandbox.
 
 This script runs inside the sandbox container. It:
-1. Reads Python code from a mounted file (/tmp/code/main.py)
+1. Reads base64-encoded source code from the `CODE_B64` environment variable
 2. Executes it with stdout/stderr capture
 3. Auto-patches matplotlib to save all figures to /tmp/output/
 4. Scans /tmp/output/ for generated files
@@ -16,19 +16,19 @@ import io
 import json
 import mimetypes
 import os
+import site
 import signal
-import subprocess
 import shutil
+import subprocess
 import sys
 import time
 import traceback
 import uuid
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
+from typing import Any
 
-# --- Configuration ---
 CODE_PATH = Path("/tmp/code/main.py")
-# Module-level defaults, updated in main() with per-execution scoping
 OUTPUT_DIR = Path("/tmp/output")
 MISC_DIR = Path("/tmp/misc")
 MAX_OUTPUT_LENGTH = 100_000  # Max chars for stdout/stderr
@@ -48,27 +48,50 @@ def get_exec_timeout(default: int = 120) -> int:
         return default
 
 
-def setup_output_dir():
+def build_result(
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    error: str | None = None,
+    error_type: str | None = None,
+    files: list[dict[str, Any]] | None = None,
+    execution_time: float = 0,
+    install_time: float | None = None,
+) -> dict[str, Any]:
+    """Build a normalized executor result payload."""
+    result: dict[str, Any] = {
+        "stdout": truncate_output(stdout),
+        "stderr": truncate_output(stderr),
+        "error": error,
+        "error_type": error_type,
+        "files": files or [],
+        "execution_time": execution_time,
+    }
+    if install_time is not None:
+        result["install_time"] = install_time
+    return result
+
+
+def setup_output_dir() -> None:
     """Ensure the output directory exists and is clean."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     clear_output_dir()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    MISC_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def clear_output_dir():
+def clear_output_dir() -> None:
     """Clear the per-execution output and misc directories after execution."""
     if OUTPUT_DIR.exists():
-        shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+        for child in OUTPUT_DIR.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
     if MISC_DIR.exists():
         shutil.rmtree(MISC_DIR, ignore_errors=True)
-    # Remove empty parent dirs if possible
-    for parent in (OUTPUT_DIR.parent, MISC_DIR.parent):
-        try:
-            parent.rmdir()
-        except OSError:
-            pass
 
 
-def patch_matplotlib():
+def patch_matplotlib() -> None:
     """
     Patch matplotlib to:
     - Use the non-interactive Agg backend
@@ -79,7 +102,6 @@ def patch_matplotlib():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        _original_show = plt.show
         _figure_counter = [0]
 
         def patched_show(*args, **kwargs):
@@ -106,12 +128,12 @@ def patch_matplotlib():
         pass
 
 
-def collect_output_files():
+def collect_output_files() -> list[dict[str, Any]]:
     """
     Scan OUTPUT_DIR for generated files and return them as base64-encoded entries.
     Respects size limits to prevent memory issues.
     """
-    files = []
+    files: list[dict[str, Any]] = []
     total_size = 0
 
     if not OUTPUT_DIR.exists():
@@ -176,8 +198,7 @@ def collect_output_files():
             mime_type = "application/octet-stream"
 
         # Read and encode
-        with open(filepath, "rb") as f:
-            content = f.read()
+        content = filepath.read_bytes()
 
         files.append({
             "name": relative_name,
@@ -197,12 +218,27 @@ def truncate_output(text: str, max_length: int = MAX_OUTPUT_LENGTH) -> str:
     return text
 
 
-def _list_residual_pids() -> list[int]:
-    """List residual process PIDs excluding PID 1 and current process."""
-    current_pid = os.getpid()
-    pids: list[int] = []
+def _read_parent_pid(proc_entry: Path) -> int | None:
+    """Read a process parent PID from `/proc/<pid>/status`."""
+    try:
+        for line in proc_entry.joinpath("status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("PPid:"):
+                return int(line.split(":", 1)[1].strip())
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+        return None
+    return None
 
-    for proc_entry in Path("/proc").iterdir():
+
+def _list_residual_pids() -> list[int]:
+    """List descendant process PIDs spawned by the current executor process."""
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+
+    current_pid = os.getpid()
+    parent_map: dict[int, int] = {}
+
+    for proc_entry in proc_root.iterdir():
         if not proc_entry.name.isdigit():
             continue
 
@@ -210,19 +246,33 @@ def _list_residual_pids() -> list[int]:
         if pid in {1, current_pid}:
             continue
 
+        parent_pid = _read_parent_pid(proc_entry)
+        if parent_pid is None:
+            continue
+
         try:
             os.kill(pid, 0)
         except (ProcessLookupError, PermissionError):
             continue
-        pids.append(pid)
 
-    return pids
+        parent_map[pid] = parent_pid
+
+    residual_pids: list[int] = []
+    frontier = {current_pid}
+    while frontier:
+        next_frontier: set[int] = set()
+        for pid, parent_pid in parent_map.items():
+            if parent_pid not in frontier:
+                continue
+            residual_pids.append(pid)
+            next_frontier.add(pid)
+        frontier = next_frontier
+
+    return residual_pids
 
 
 def terminate_residual_processes() -> None:
-    """Terminate all residual processes except PID 1 and current process."""
-    # NOTE: This kills ALL processes except PID 1 and ourselves. This is safe
-    # because the gateway serializes execution per container (one exec at a time).
+    """Terminate any descendant processes left behind by executed user code."""
     residual_pids = _list_residual_pids()
     if not residual_pids:
         return
@@ -251,7 +301,22 @@ def terminate_residual_processes() -> None:
             time.sleep(0.05)
 
 
-def execute_code(code: str) -> dict:
+def terminate_process_group(process_group_id: int) -> None:
+    """Terminate a process group and any background jobs it still owns."""
+    for sig, deadline_seconds in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
+        with suppress(ProcessLookupError):
+            os.killpg(process_group_id, sig)
+
+        deadline = time.monotonic() + deadline_seconds
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process_group_id, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+
+
+def execute_code(code: str) -> dict[str, Any]:
     """
     Execute the given Python code and capture results.
 
@@ -304,23 +369,23 @@ def execute_code(code: str) -> dict:
     terminate_residual_processes()
     files = collect_output_files()
 
-    return {
-        "stdout": truncate_output(stdout_capture.getvalue()),
-        "stderr": truncate_output(stderr_capture.getvalue()),
-        "error": error,
-        "error_type": error_type,
-        "files": files,
-        "execution_time": execution_time,
-    }
+    return build_result(
+        stdout=stdout_capture.getvalue(),
+        stderr=stderr_capture.getvalue(),
+        error=error,
+        error_type=error_type,
+        files=files,
+        execution_time=execution_time,
+    )
 
 
-def execute_bash(code: str) -> dict:
-    """
-    Execute the given Bash code and capture results.
-    """
+def execute_bash(code: str) -> dict[str, Any]:
+    """Execute Bash code and capture stdout, stderr, files, and timing."""
     start_time = time.monotonic()
     error = None
     error_type = None
+    stdout_text = ""
+    stderr_text = ""
 
     # Write code to a temporary script file inside the tmpfs mount
     script_path = MISC_DIR / "script.sh"
@@ -329,31 +394,31 @@ def execute_bash(code: str) -> dict:
     script_path.chmod(0o755)
 
     try:
-        # Run the script
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["/bin/bash", str(script_path)],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=get_exec_timeout(),
+            start_new_session=True,
         )
-        
-        stdout_text = result.stdout
-        stderr_text = result.stderr
-        
-        if result.returncode != 0:
-            error = f"Bash script exited with code {result.returncode}"
+        try:
+            stdout_text, stderr_text = process.communicate(timeout=get_exec_timeout())
+        finally:
+            terminate_process_group(process.pid)
+
+        if process.returncode != 0:
+            error = f"Bash script exited with code {process.returncode}"
             error_type = "BashExitError"
 
     except subprocess.TimeoutExpired as e:
         error = "Bash execution timed out"
         error_type = "TimeoutError"
-        stdout_text = e.stdout.decode() if e.stdout else ""
-        stderr_text = e.stderr.decode() if e.stderr else ""
+        stdout_text = e.stdout if isinstance(e.stdout, str) else (e.stdout.decode() if e.stdout else "")
+        stderr_text = e.stderr if isinstance(e.stderr, str) else (e.stderr.decode() if e.stderr else "")
+        terminate_process_group(process.pid)
     except Exception as e:
         error = f"Bash execution failed: {str(e)}"
         error_type = type(e).__name__
-        stdout_text = ""
-        stderr_text = ""
     finally:
         # Cleanup script
         if script_path.exists():
@@ -364,17 +429,17 @@ def execute_bash(code: str) -> dict:
     terminate_residual_processes()
     files = collect_output_files()
 
-    return {
-        "stdout": truncate_output(stdout_text),
-        "stderr": truncate_output(stderr_text),
-        "error": error,
-        "error_type": error_type,
-        "files": files,
-        "execution_time": execution_time,
-    }
+    return build_result(
+        stdout=stdout_text,
+        stderr=stderr_text,
+        error=error,
+        error_type=error_type,
+        files=files,
+        execution_time=execution_time,
+    )
 
 
-def install_pip_packages():
+def install_pip_packages() -> tuple[str | None, float | None]:
     """Install packages specified in PIP_PACKAGES environment variable."""
     packages_str = os.environ.get("PIP_PACKAGES", "").strip()
     if not packages_str:
@@ -384,7 +449,6 @@ def install_pip_packages():
     if not packages:
         return None, None
 
-    import subprocess
     import importlib
     install_timeout = get_exec_timeout()
     start_install = time.monotonic()
@@ -393,16 +457,16 @@ def install_pip_packages():
         # --no-cache-dir to keep it clean and fast
         cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", "--quiet"] + packages
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=install_timeout)
-        
+
         install_time = round(time.monotonic() - start_install, 2)
-        
+
         # Invalidate caches so new packages are found
         importlib.invalidate_caches()
-        
+
         if result.returncode != 0:
             error_msg = f"Pip install failed with code {result.returncode}:\n{result.stderr or result.stdout}"
             return error_msg, install_time
-            
+
         return None, install_time
     except subprocess.TimeoutExpired:
         return f"Pip install timed out after {install_timeout} seconds", round(time.monotonic() - start_install, 2)
@@ -410,12 +474,29 @@ def install_pip_packages():
         return f"Pip install exception: {str(e)}", round(time.monotonic() - start_install, 2)
 
 
-def emit_result(result: dict) -> None:
+def decode_code_from_environment() -> str:
+    """Decode the base64-encoded source code passed in the environment."""
+    code_b64 = os.environ.get("CODE_B64", "")
+    if not code_b64:
+        raise ValueError("No code provided (set CODE_B64 env var)")
+
+    try:
+        code = base64.b64decode(code_b64, validate=True).decode("utf-8")
+    except Exception as exc:
+        raise ValueError(f"Failed to decode CODE_B64: {exc}") from exc
+
+    if not code.strip():
+        raise ValueError("Empty code provided")
+    return code
+
+
+def emit_result(result: dict[str, Any]) -> None:
+    """Emit the structured executor result with a stable prefix for the gateway."""
     payload = json.dumps(result)
     print(f"{RESULT_PREFIX}{payload}")
 
 
-def main():
+def main() -> None:
     """Main entry point for the executor."""
     global OUTPUT_DIR, MISC_DIR
 
@@ -425,7 +506,6 @@ def main():
     args = parser.parse_args()
 
     exec_id = args.exec_id or uuid.uuid4().hex[:12]
-    OUTPUT_DIR = Path(f"/tmp/output/{exec_id}")
     MISC_DIR = Path(f"/tmp/misc/{exec_id}")
 
     setup_output_dir()
@@ -437,64 +517,27 @@ def main():
         install_error, install_time = install_pip_packages()
 
         # Ensure user site-packages are in sys.path
-        import site
         user_site = site.getusersitepackages()
         if user_site and user_site not in sys.path:
             sys.path.append(user_site)
     else:
         install_error, install_time = None, None
 
-    # Read code from base64-encoded environment variable
-    code_b64 = os.environ.get("CODE_B64", "")
-    
-    if code_b64:
-        try:
-            code = base64.b64decode(code_b64).decode("utf-8")
-        except Exception as e:
-            result = {
-                "stdout": "",
-                "stderr": "",
-                "error": f"Failed to decode CODE_B64: {e}",
-                "error_type": "ValueError",
-                "files": [],
-                "execution_time": 0,
-            }
-            emit_result(result)
-            sys.exit(1)
-    else:
-        result = {
-            "stdout": "",
-            "stderr": "",
-            "error": "No code provided (set CODE_B64 env var)",
-            "error_type": "ValueError",
-            "files": [],
-            "execution_time": 0,
-        }
-        emit_result(result)
-        sys.exit(1)
-
-    if not code.strip():
-        result = {
-            "stdout": "",
-            "stderr": "",
-            "error": "Empty code provided",
-            "error_type": "ValueError",
-            "files": [],
-            "execution_time": 0,
-        }
-        emit_result(result)
+    try:
+        code = decode_code_from_environment()
+    except ValueError as exc:
+        emit_result(build_result(error=str(exc), error_type="ValueError"))
         sys.exit(1)
 
     # Execute the code
     if args.lang == "python":
         result = execute_code(code)
-    elif args.lang == "bash":
+    else:
         result = execute_bash(code)
 
-    # Add install info if any for python
-    if install_time:
+    if install_time is not None:
         result["install_time"] = install_time
-    
+
     if install_error:
         # If install failed, we prepend the error to stderr
         result["stderr"] = f"--- PIP INSTALL ERROR ---\n{install_error}\n------------------------\n" + result["stderr"]

@@ -10,6 +10,7 @@ from unittest import mock
 
 import docker.errors
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 
 GATEWAY_DIR = Path(__file__).resolve().parent / "gateway"
@@ -241,6 +242,45 @@ class GatewayConfigurationTests(unittest.TestCase):
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0].key_id, "key-1")
         self.assertEqual(parsed[0].secret, "my-secret")
+
+    def test_execute_request_rejects_unknown_language(self) -> None:
+        with self.assertRaises(ValidationError):
+            gateway_app.ExecuteRequest(
+                container_id="ctr-1",
+                language="ruby",
+                code="puts 'nope'",
+            )
+
+    def test_file_input_rejects_backslash_paths(self) -> None:
+        with self.assertRaises(ValidationError):
+            gateway_app.FileInput(name="folder\\file.txt", content="aGVsbG8=")
+
+
+class FilePreparationTests(unittest.TestCase):
+    def test_prepare_files_rejects_duplicate_names(self) -> None:
+        files = [
+            gateway_app.FileInput(name="input.txt", content="aGVsbG8="),
+            gateway_app.FileInput(name="input.txt", content="d29ybGQ="),
+        ]
+
+        with self.assertRaises(HTTPException) as ctx:
+            gateway_app.prepare_files(files)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("Duplicate input file name", ctx.exception.detail)
+
+    def test_prepare_files_rejects_invalid_base64(self) -> None:
+        files = [gateway_app.FileInput(name="input.txt", content="%%%")]
+
+        with self.assertRaises(HTTPException) as ctx:
+            gateway_app.prepare_files(files)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("not valid base64", ctx.exception.detail)
+
+    def test_parse_executor_result_rejects_empty_output(self) -> None:
+        with self.assertRaises(gateway_app.ExecutorOutputError):
+            gateway_app.parse_executor_result("")
 
 
 class ExecutionLockTests(unittest.IsolatedAsyncioTestCase):

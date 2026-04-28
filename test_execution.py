@@ -8,15 +8,11 @@ Usage:
 
 import argparse
 import base64
-import json
-import os
 import sys
 import time
-import urllib.error
-import urllib.request
 
+from verification_client import GatewayClient, env_flag
 
-BASE_URL = "http://localhost:8000"
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -24,61 +20,23 @@ CYAN = "\033[96m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
-
-def resolve_token() -> str | None:
-    """Resolve API token from environment variables."""
-    for env_name in ("API_TOKEN", "API_KEY"):
-        value = os.getenv(env_name)
-        if value:
-            return value
-
-    api_keys = os.getenv("API_KEYS", "")
-    if not api_keys:
-        return None
-
-    first = api_keys.split(",", 1)[0].strip()
-    if ":" in first:
-        return first.split(":", 1)[1]
-    return first or None
-
-
-TOKEN = resolve_token()
-
-
-def request(method: str, path: str, payload: dict | None = None, timeout: int = 90) -> tuple[int, dict]:
-    """Make HTTP request to the gateway API."""
-    data = None
-    headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        data=data,
-        headers=headers,
-        method=method,
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-            return resp.status, json.loads(body) if body else {}
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        return exc.code, json.loads(body) if body else {}
+CLIENT = GatewayClient.from_environment()
 
 
 def execute(code: str, timeout: int = 30, enable_network: bool = True, language: str = "python") -> dict:
     """Execute code in a container session and return result."""
-    status, container = request("POST", "/containers", {"enable_network": enable_network}, timeout=30)
+    status, container = CLIENT.request(
+        "POST",
+        "/containers",
+        {"enable_network": enable_network},
+        timeout=30,
+    )
     if status != 200:
         return {"error": f"Failed to create container: {container}", "error_type": "SetupError"}
 
     container_id = container["container_id"]
     try:
-        status, result = request(
+        status, result = CLIENT.request(
             "POST",
             "/execute",
             {
@@ -94,12 +52,12 @@ def execute(code: str, timeout: int = 30, enable_network: bool = True, language:
             return {"error": f"HTTP {status}: {result}", "error_type": "HTTPError"}
         return result
     finally:
-        request("DELETE", f"/containers/{container_id}", timeout=30)
+        CLIENT.request("DELETE", f"/containers/{container_id}", timeout=30)
 
 
 def test_health():
     """Test basic health check endpoint."""
-    status, data = request("GET", "/healthz", timeout=10)
+    status, data = CLIENT.request("GET", "/healthz", timeout=10)
     assert status == 200, data
     assert data["status"] == "healthy", f"Service unhealthy: {data}"
     return True, "Health check passed"
@@ -107,7 +65,7 @@ def test_health():
 
 def test_health_details():
     """Test detailed health check endpoint."""
-    status, data = request("GET", "/healthz/details", timeout=10)
+    status, data = CLIENT.request("GET", "/healthz/details", timeout=10)
     assert status == 200, data
     assert data["status"] == "healthy", f"Detailed health check failed: {data}"
     assert "docker_connected" in data, data
@@ -243,6 +201,9 @@ print(f"Shape: {df.shape}")
 
 def test_network_access():
     """Test network access from sandbox."""
+    if not env_flag("RUN_SANDBOX_NETWORK_TESTS", default=False):
+        return True, "Skipped outbound network test (set RUN_SANDBOX_NETWORK_TESTS=true to enable)"
+
     code = """
 import requests
 resp = requests.get("https://httpbin.org/get", timeout=10)
@@ -256,12 +217,12 @@ print(f"Status: {resp.status_code}")
 
 def test_background_process_cleanup():
     """Test cleanup of background processes between executions."""
-    status, container = request("POST", "/containers", {"enable_network": False}, timeout=30)
+    status, container = CLIENT.request("POST", "/containers", {"enable_network": False}, timeout=30)
     assert status == 200, container
 
     container_id = container["container_id"]
     try:
-        status, result = request(
+        status, result = CLIENT.request(
             "POST",
             "/execute",
             {
@@ -275,7 +236,7 @@ def test_background_process_cleanup():
         assert status == 200, result
         assert result.get("error") is None, result
 
-        status, result = request(
+        status, result = CLIENT.request(
             "POST",
             "/execute",
             {
@@ -299,7 +260,7 @@ def test_background_process_cleanup():
         assert result.get("stdout", "").strip() == "clean", result
         return True, "Residual processes are cleaned between executions"
     finally:
-        request("DELETE", f"/containers/{container_id}", timeout=30)
+        CLIENT.request("DELETE", f"/containers/{container_id}", timeout=30)
 
 
 TESTS = [
@@ -324,12 +285,12 @@ def main():
     parser.add_argument("--url", default="http://localhost:8000", help="Service URL")
     args = parser.parse_args()
 
-    global BASE_URL
-    BASE_URL = args.url.rstrip("/")
+    global CLIENT
+    CLIENT = GatewayClient.from_environment(base_url=args.url.rstrip("/"))
 
     print(f"\n{BOLD}{'=' * 60}{RESET}")
     print(f"{BOLD}  Code Execution Service — Integration Tests{RESET}")
-    print(f"{BOLD}  Target: {BASE_URL}{RESET}")
+    print(f"{BOLD}  Target: {CLIENT.base_url}{RESET}")
     print(f"{BOLD}{'=' * 60}{RESET}\n")
 
     passed = 0

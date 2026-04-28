@@ -6,7 +6,7 @@ Hardened Docker-based code execution for untrusted Python and Bash workloads.
 
 - Auth is mandatory by default in production and supports rotated static bearer keys or expiring JWTs.
 - CORS is explicit-origin only; wildcard credentials are rejected at startup.
-- Sandbox sessions now run with a read-only root filesystem, `no-new-privileges`, dropped capabilities, fixed UID/GID, and writable tmpfs mounts only where execution needs them.
+- Sandbox sessions now run with `no-new-privileges`, dropped capabilities, fixed UID/GID, and writable tmpfs mounts only where execution needs them. The root filesystem is configurable via `SANDBOX_READ_ONLY_ROOTFS`; keep it writable if you need Docker-side file uploads such as input files or sandbox `.env` injection.
 - Shared session ownership and rate limiting are backed by Redis, and each session is bound to a Docker daemon identity so the wrong replica cannot delete or hijack it.
 - Container creation now passes through a shared guard before quota checks, so per-principal and global session caps remain race-safe under concurrent load.
 - Local development can use an explicit `local-docker` compose profile, while production must target a dedicated remote Docker daemon instead of the host socket.
@@ -52,6 +52,7 @@ To create a sandbox that can see values from `.env_sandbox`, first set `ALLOW_SA
 - `SANDBOX_NETWORK_MODE=none`: Network egress is disabled by default. Set to `bridge` only for workloads that require internet access.
 - `ALLOW_PIP_INSTALLS=false`: Runtime pip installs are disabled by default. Enable only for trusted workloads.
 - `ALLOW_SANDBOX_ENV_INJECTION=false`: Keeps `.env_sandbox` out of untrusted sandboxes unless explicitly enabled.
+- `SANDBOX_READ_ONLY_ROOTFS=false`: Required if you use input file uploads or gateway-side `.env` injection, because Docker archive uploads do not work against read-only container root filesystems.
 - `USE_DOCKER_DEFAULT_SECCOMP=true`: Uses Docker's hardened RuntimeDefault seccomp profile.
 - `SECCOMP_PROFILE_DAEMON_PATH`: Required only when `USE_DOCKER_DEFAULT_SECCOMP=false`. This must point to a seccomp profile file on the Docker daemon host, not a path inside the gateway container. The checked-in profile under `security/seccomp-profile.json` is a source artifact you can copy to that host path.
 - `METRICS_AUTH_REQUIRED=true`: Protects `/metrics` behind bearer auth in production.

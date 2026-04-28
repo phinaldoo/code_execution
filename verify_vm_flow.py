@@ -1,68 +1,21 @@
 #!/usr/bin/env python3
 import base64
-import json
-import os
-import urllib.error
-import urllib.request
+from verification_client import GatewayClient
 
 
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-
-
-def resolve_token() -> str | None:
-    """Resolve API token from environment variables."""
-    for env_name in ("API_TOKEN", "API_KEY"):
-        value = os.getenv(env_name)
-        if value:
-            return value
-
-    api_keys = os.getenv("API_KEYS", "")
-    if not api_keys:
-        return None
-
-    first = api_keys.split(",", 1)[0].strip()
-    if ":" in first:
-        return first.split(":", 1)[1]
-    return first or None
-
-
-TOKEN = resolve_token()
-
-
-def request(method: str, path: str, payload: dict | None = None, timeout: int = 60):
-    """Make HTTP request to the gateway API."""
-    data = None
-    headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        data=data,
-        headers=headers,
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-            return response.status, json.loads(body) if body else {}
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        return exc.code, json.loads(body) if body else {}
+CLIENT = GatewayClient.from_environment()
 
 
 def main():
     """Verify VM flow including health, container creation, and code execution."""
     print("1. Checking health...")
-    status, payload = request("GET", "/healthz")
+    status, payload = CLIENT.request("GET", "/healthz", timeout=60)
     assert status == 200, payload
     assert payload["status"] == "healthy", payload
     print("   Health OK")
 
     print("2. Creating container session...")
-    status, created = request("POST", "/containers", {"enable_network": True})
+    status, created = CLIENT.request("POST", "/containers", {"enable_network": True}, timeout=60)
     assert status == 200, created
     container_id = created["container_id"]
     print(f"   Container: {container_id}")
@@ -74,7 +27,7 @@ def main():
             "with open('/home/sandbox/test.txt', 'w', encoding='utf-8') as handle:\n"
             "    handle.write('Python was here')\n"
         )
-        status, result = request(
+        status, result = CLIENT.request(
             "POST",
             "/execute",
             {
@@ -82,6 +35,7 @@ def main():
                 "language": "python",
                 "code": python_code,
             },
+            timeout=60,
         )
         assert status == 200, result
         assert "Hello from persistent Python session!" in result["stdout"], result
@@ -89,7 +43,7 @@ def main():
 
         print("4. Executing Bash code...")
         bash_code = "echo 'Hello from Bash!'\ncat /home/sandbox/test.txt"
-        status, result = request(
+        status, result = CLIENT.request(
             "POST",
             "/execute",
             {
@@ -97,6 +51,7 @@ def main():
                 "language": "bash",
                 "code": bash_code,
             },
+            timeout=60,
         )
         assert status == 200, result
         assert "Python was here" in result["stdout"], result
@@ -108,7 +63,7 @@ def main():
             "cat /home/sandbox/input.txt\n"
             "echo \"Processed: $(cat /home/sandbox/input.txt)\" > /tmp/output/result.txt\n"
         )
-        status, result = request(
+        status, result = CLIENT.request(
             "POST",
             "/execute",
             {
@@ -117,6 +72,7 @@ def main():
                 "code": script,
                 "files": [{"name": "input.txt", "content": input_b64}],
             },
+            timeout=60,
         )
         assert status == 200, result
         assert result["files"], result
@@ -125,7 +81,7 @@ def main():
         print("   File flow OK")
     finally:
         print("6. Deleting container session...")
-        status, result = request("DELETE", f"/containers/{container_id}")
+        status, result = CLIENT.request("DELETE", f"/containers/{container_id}", timeout=60)
         assert status == 200, result
         print("   Cleanup OK")
 
