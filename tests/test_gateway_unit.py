@@ -13,12 +13,13 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 
-GATEWAY_DIR = Path(__file__).resolve().parent / "gateway"
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+GATEWAY_DIR = PROJECT_DIR / "gateway"
 if str(GATEWAY_DIR) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR))
 
 import app as gateway_app
-from state import InMemoryStateBackend, SessionInfo
+from state import InMemoryStateBackend, RedisStateBackend, SessionInfo
 
 
 class GatewaySafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -127,6 +128,37 @@ class GatewaySafetyTests(unittest.IsolatedAsyncioTestCase):
         remove_mock.assert_awaited_once()
         self.assertEqual(remove_mock.await_args.args[0], "ctr-save-fail")
         self.assertEqual(remove_mock.await_args.kwargs["reason"], "state-save-failed")
+
+    async def test_create_container_session_uses_read_only_rootfs_and_effective_network(self) -> None:
+        fake_container = SimpleNamespace(id="ctr-safe-defaults")
+        gateway_app.docker_client = SimpleNamespace(
+            containers=SimpleNamespace(run=mock.Mock(return_value=fake_container))
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(gateway_app, "SANDBOX_NETWORK_MODE", "none"))
+            stack.enter_context(mock.patch.object(gateway_app, "SANDBOX_READ_ONLY_ROOTFS", True))
+
+            container_id = await gateway_app.create_container_session(
+                enable_network=True,
+                auth=gateway_app.AuthContext(
+                    subject="subject-1",
+                    tenant=None,
+                    auth_type="api_key",
+                ),
+                inject_sandbox_env=False,
+            )
+
+        self.assertEqual(container_id, "ctr-safe-defaults")
+        run_kwargs = gateway_app.docker_client.containers.run.call_args.kwargs
+        self.assertTrue(run_kwargs["read_only"])
+        self.assertEqual(run_kwargs["network_mode"], "none")
+        self.assertIn("/tmp", run_kwargs["tmpfs"])
+        self.assertIn("/home/sandbox", run_kwargs["tmpfs"])
+
+        session = await self.state_backend.get_session(container_id)
+        self.assertIsNotNone(session)
+        self.assertFalse(session.network_enabled)
 
     async def test_run_code_in_sandbox_prefers_prefixed_executor_payload(self) -> None:
         await self.state_backend.save_session(
@@ -255,6 +287,9 @@ class GatewayConfigurationTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             gateway_app.FileInput(name="folder\\file.txt", content="aGVsbG8=")
 
+    def test_create_container_request_network_defaults_to_off(self) -> None:
+        self.assertFalse(gateway_app.CreateContainerRequest().enable_network)
+
 
 class FilePreparationTests(unittest.TestCase):
     def test_prepare_files_rejects_duplicate_names(self) -> None:
@@ -281,6 +316,71 @@ class FilePreparationTests(unittest.TestCase):
     def test_parse_executor_result_rejects_empty_output(self) -> None:
         with self.assertRaises(gateway_app.ExecutorOutputError):
             gateway_app.parse_executor_result("")
+
+
+class RequestLimitAndMetricsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limited_receive_rejects_streaming_body_over_limit(self) -> None:
+        messages = [
+            {"type": "http.request", "body": b"1234", "more_body": True},
+            {"type": "http.request", "body": b"5678", "more_body": False},
+        ]
+
+        async def receive():
+            return messages.pop(0)
+
+        limited_receive = gateway_app.limited_receive_factory(receive, max_bytes=6)
+        self.assertEqual(await limited_receive(), {"type": "http.request", "body": b"1234", "more_body": True})
+        with self.assertRaises(gateway_app.RequestBodyTooLarge):
+            await limited_receive()
+
+    def test_request_content_length_limit_handles_large_and_invalid_values(self) -> None:
+        large = SimpleNamespace(headers={"content-length": "100"})
+        invalid = SimpleNamespace(headers={"content-length": "not-an-int"})
+        missing = SimpleNamespace(headers={})
+
+        with mock.patch.object(gateway_app, "MAX_REQUEST_BODY_SIZE", 10):
+            self.assertTrue(gateway_app.request_content_length_exceeds_limit(large))
+            self.assertFalse(gateway_app.request_content_length_exceeds_limit(invalid))
+            self.assertFalse(gateway_app.request_content_length_exceeds_limit(missing))
+
+    def test_metrics_path_label_uses_route_template(self) -> None:
+        request = SimpleNamespace(
+            scope={"route": SimpleNamespace(path="/containers/{container_id}")},
+            url=SimpleNamespace(path="/containers/abc123"),
+        )
+
+        self.assertEqual(
+            gateway_app.metrics_path_label(request),
+            "/containers/{container_id}",
+        )
+
+    def test_metrics_path_label_collapses_unmatched_routes(self) -> None:
+        request = SimpleNamespace(
+            scope={},
+            url=SimpleNamespace(path="/made-up/abc123"),
+        )
+
+        self.assertEqual(gateway_app.metrics_path_label(request), "__unmatched__")
+
+
+class RedisConfigurationTests(unittest.TestCase):
+    def test_redis_backend_configures_socket_timeouts(self) -> None:
+        with mock.patch("state.redis_asyncio.from_url") as from_url:
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "REDIS_SOCKET_CONNECT_TIMEOUT": "1.5",
+                    "REDIS_SOCKET_TIMEOUT": "2.5",
+                    "REDIS_HEALTH_CHECK_INTERVAL": "15",
+                },
+            ):
+                RedisStateBackend("redis://example.test:6379/0")
+
+        _, kwargs = from_url.call_args
+        self.assertEqual(kwargs["socket_connect_timeout"], 1.5)
+        self.assertEqual(kwargs["socket_timeout"], 2.5)
+        self.assertEqual(kwargs["health_check_interval"], 15)
+        self.assertTrue(kwargs["retry_on_timeout"])
 
 
 class ExecutionLockTests(unittest.IsolatedAsyncioTestCase):

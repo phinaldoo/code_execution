@@ -3,7 +3,7 @@
 Integration tests for the Code Execution Service.
 
 Usage:
-    python3 test_execution.py [--url http://localhost:8000]
+    python3 tests/test_execution.py [--url http://localhost:8000]
 """
 
 import argparse

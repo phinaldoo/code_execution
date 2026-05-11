@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 
-COMPOSE := docker compose
-COMPOSE_LOCAL := docker compose --profile local-docker
+COMPOSE := env -u DOCKER_HOST docker compose
+COMPOSE_LOCAL := env -u DOCKER_HOST docker compose --profile local-docker
 DEFAULT_GOAL := help
 
 .PHONY: help setup build up down restart logs ps update

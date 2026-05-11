@@ -47,9 +47,9 @@ services:
     image: redis:7.4.2-alpine
     user: "999:999"
     restart: unless-stopped
-    command: [ "redis-server", "--save", "", "--appendonly", "no" ]
-    tmpfs:
-      - /data:rw,noexec,nosuid,nodev,size=64m,uid=999,gid=999,mode=0750
+    command: [ "redis-server", "--save", "", "--appendonly", "yes", "--appendfsync", "everysec" ]
+    volumes:
+      - redis-data:/data
     cap_drop:
       - ALL
     security_opt:
@@ -93,7 +93,11 @@ services:
       - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
       - METRICS_AUTH_REQUIRED=${METRICS_AUTH_REQUIRED:-true}
       - REQUIRE_SHARED_STATE=${REQUIRE_SHARED_STATE:-true}
+      - REDIS_SOCKET_CONNECT_TIMEOUT=${REDIS_SOCKET_CONNECT_TIMEOUT:-5}
+      - REDIS_SOCKET_TIMEOUT=${REDIS_SOCKET_TIMEOUT:-5}
+      - REDIS_HEALTH_CHECK_INTERVAL=${REDIS_HEALTH_CHECK_INTERVAL:-30}
       - SANDBOX_IMAGE=${SANDBOX_IMAGE:-code-sandbox:latest}
+      - MAX_REQUEST_BODY_SIZE=${MAX_REQUEST_BODY_SIZE:-33554432}
       - MAX_CONCURRENT_EXECUTIONS=${MAX_CONCURRENT_EXECUTIONS:-10}
       - MAX_ACTIVE_SESSIONS=${MAX_ACTIVE_SESSIONS:-100}
       - MAX_CONTAINERS_PER_PRINCIPAL=${MAX_CONTAINERS_PER_PRINCIPAL:-3}
@@ -106,19 +110,17 @@ services:
       - SANDBOX_CPU_PERIOD=${SANDBOX_CPU_PERIOD:-100000}
       - SANDBOX_CPU_QUOTA=${SANDBOX_CPU_QUOTA:-100000}
       - SANDBOX_PIDS_LIMIT=${SANDBOX_PIDS_LIMIT:-256}
-      - SANDBOX_TMPFS_SIZE=${SANDBOX_TMPFS_SIZE:-100m}
-      - SANDBOX_MPL_CACHE_TMPFS_SIZE=${SANDBOX_MPL_CACHE_TMPFS_SIZE:-32m}
-      - SANDBOX_MISC_TMPFS_SIZE=${SANDBOX_MISC_TMPFS_SIZE:-128m}
+      - SANDBOX_TMP_ROOT_SIZE=${SANDBOX_TMP_ROOT_SIZE:-512m}
       - SANDBOX_SHM_SIZE=${SANDBOX_SHM_SIZE:-128m}
       - SANDBOX_HOME_TMPFS_SIZE=${SANDBOX_HOME_TMPFS_SIZE:-256m}
-      - SANDBOX_READ_ONLY_ROOTFS=${SANDBOX_READ_ONLY_ROOTFS:-false}
+      - SANDBOX_READ_ONLY_ROOTFS=${SANDBOX_READ_ONLY_ROOTFS:-true}
       - SANDBOX_NETWORK_MODE=${SANDBOX_NETWORK_MODE:-none}
       - SANDBOX_UID=${SANDBOX_UID:-10001}
       - SANDBOX_GID=${SANDBOX_GID:-10001}
       - ALLOW_PIP_INSTALLS=${ALLOW_PIP_INSTALLS:-false}
       - USE_DOCKER_DEFAULT_SECCOMP=${USE_DOCKER_DEFAULT_SECCOMP:-true}
       - ALLOW_SANDBOX_ENV_INJECTION=${ALLOW_SANDBOX_ENV_INJECTION:-false}
-      - DOCKER_HOST=${DOCKER_HOST:-tcp://docker-proxy:2375}
+      - DOCKER_HOST=${GATEWAY_DOCKER_HOST:-tcp://docker-proxy:2375}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - SANDBOX_ENV_SOURCE_PATH=/etc/code-execution/.env_sandbox
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
@@ -156,3 +158,6 @@ services:
 networks:
   control-plane:
     internal: true
+
+volumes:
+  redis-data:

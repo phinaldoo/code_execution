@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import os
 import time
 import uuid
 from collections import deque
@@ -230,6 +231,10 @@ return 1
             redis_url,
             encoding="utf-8",
             decode_responses=True,
+            socket_connect_timeout=float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "5")),
+            socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT", "5")),
+            health_check_interval=int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL", "30")),
+            retry_on_timeout=True,
         )
         self._session_index_key = "gateway:sessions:index"
         self._creation_lock_key = "gateway:lock:container-create"

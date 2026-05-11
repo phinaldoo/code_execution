@@ -5,7 +5,7 @@
 # ============================================================
 
 ARG PYTHON_BASE_IMAGE=python:3.12-slim-bookworm@sha256:dba9a3ac4914b5ae6f790188ff39267e46e0087fa0f4713592b5d32350edb5ef
-FROM ${PYTHON_BASE_IMAGE}
+FROM ${PYTHON_BASE_IMAGE} AS base
 
 # --- System Setup ---
 RUN apt-get update && \

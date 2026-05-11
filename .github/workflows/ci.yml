@@ -32,9 +32,9 @@ jobs:
       - name: Install gateway test dependencies
         run: python -m pip install -r gateway/requirements.txt
       - name: Compile Python sources
-        run: python -m compileall gateway sandbox verify_vm_flow.py verify_playwright.py verify_features.py test_execution.py test_gateway_unit.py
+        run: python -m compileall gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py
       - name: Run unit tests
-        run: python -m unittest -q test_gateway_unit.py
+        run: python -m unittest -q tests/test_gateway_unit.py
       - name: Run Bandit
         run: bandit -q -r gateway sandbox
       - name: Audit gateway dependencies
@@ -64,15 +64,15 @@ jobs:
       - name: Smoke test container lifecycle
         env:
           API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-        run: python3 verify_vm_flow.py
+        run: python3 tests/verify_vm_flow.py
       - name: Smoke test Playwright
         env:
           API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-        run: python3 verify_playwright.py
+        run: python3 tests/verify_playwright.py
       - name: Run integration suite
         env:
           API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-        run: python3 test_execution.py
+        run: python3 tests/test_execution.py
       - name: Scan gateway image
         uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
         with:

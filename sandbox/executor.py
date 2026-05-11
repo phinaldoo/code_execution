@@ -12,10 +12,10 @@ This script runs inside the sandbox container. It:
 
 import argparse
 import base64
-import io
 import json
 import mimetypes
 import os
+import re
 import site
 import signal
 import shutil
@@ -24,7 +24,7 @@ import sys
 import time
 import traceback
 import uuid
-from contextlib import redirect_stderr, redirect_stdout, suppress
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -304,65 +304,133 @@ def terminate_residual_processes() -> None:
 def terminate_process_group(process_group_id: int) -> None:
     """Terminate a process group and any background jobs it still owns."""
     for sig, deadline_seconds in ((signal.SIGTERM, 0.5), (signal.SIGKILL, 0.5)):
-        with suppress(ProcessLookupError):
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(process_group_id, sig)
 
         deadline = time.monotonic() + deadline_seconds
         while time.monotonic() < deadline:
             try:
                 os.killpg(process_group_id, 0)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 return
             time.sleep(0.05)
 
 
-def execute_code(code: str) -> dict[str, Any]:
-    """
-    Execute the given Python code and capture results.
+def _decode_process_output(value: str | bytes | None) -> str:
+    """Decode subprocess output that may be text, bytes, or absent."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
-    Returns a dict with stdout, stderr, files, error info, and timing.
-    """
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
 
-    start_time = time.monotonic()
-    error = None
-    error_type = None
+def _python_signal_error(returncode: int) -> tuple[str, str]:
+    """Build error fields for a Python child terminated by a signal."""
+    signum = -returncode
+    signal_name = f"signal {signum}"
+    with suppress(ValueError):
+        signal_name = signal.Signals(signum).name
+    return f"Python process terminated by {signal_name}", "ProcessSignalError"
+
+
+def _infer_python_error(stderr_text: str, returncode: int) -> tuple[str, str]:
+    """Infer stable error fields from Python child stderr and exit status."""
+    if returncode < 0:
+        return _python_signal_error(returncode)
+
+    stderr = stderr_text.strip()
+    if not stderr:
+        return f"Python process exited with code {returncode}", "SystemExit"
+
+    last_line = next((line.strip() for line in reversed(stderr.splitlines()) if line.strip()), "")
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_.]*):", last_line)
+    if match:
+        return stderr, match.group(1).split(".")[-1]
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", last_line):
+        return stderr, last_line.split(".")[-1]
+    return stderr, "PythonExitError"
+
+
+def execute_python_child() -> None:
+    """Run user Python in the child process; the parent owns result emission."""
+    patch_matplotlib()
+
+    user_site = site.getusersitepackages()
+    if user_site and user_site not in sys.path:
+        sys.path.append(user_site)
 
     try:
-        # Create a clean execution namespace
+        code = decode_code_from_environment()
         exec_globals = {
             "__builtins__": __builtins__,
             "__name__": "__main__",
             "__file__": str(CODE_PATH),
         }
-
-        # Redirect stdout/stderr and execute
-        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            exec(compile(code, "<user_code>", "exec"), exec_globals)
-
-    except SyntaxError as e:
-        error_type = "SyntaxError"
-        error = f"SyntaxError: {e.msg} (line {e.lineno}, col {e.offset})"
-    except SystemExit as e:
-        error_type = "SystemExit"
-        error = f"SystemExit with code: {e.code}"
-    except Exception:
-        error_type = type(sys.exc_info()[1]).__name__
-        # Format nice traceback but filter out executor frames
+        exec(compile(code, "<user_code>", "exec"), exec_globals)
+    except SystemExit:
+        raise
+    except BaseException:
         tb_lines = traceback.format_exception(*sys.exc_info())
-        # Remove frames from this executor script
         filtered = []
         skip = False
         for line in tb_lines:
-            if 'executor.py' in line:
+            if "executor.py" in line:
                 skip = True
                 continue
-            if skip and line.startswith("  "):
+            if skip and line.startswith("    "):
                 continue
             skip = False
             filtered.append(line)
-        error = "".join(filtered).strip()
+        sys.stderr.write("".join(filtered).strip() + "\n")
+        sys.exit(1)
+
+
+def execute_code(code: str) -> dict[str, Any]:
+    """
+    Execute Python code in a child process and capture results.
+
+    Returns a dict with stdout, stderr, files, error info, and timing.
+    """
+    start_time = time.monotonic()
+    error = None
+    error_type = None
+    stdout_text = ""
+    stderr_text = ""
+    process: subprocess.Popen[str] | None = None
+
+    try:
+        child_env = os.environ.copy()
+        child_env["CODE_B64"] = base64.b64encode(code.encode("utf-8")).decode("ascii")
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__)), "--python-child"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout_text, stderr_text = process.communicate(timeout=get_exec_timeout())
+        except subprocess.TimeoutExpired as exc:
+            stdout_text = _decode_process_output(exc.stdout)
+            stderr_text = _decode_process_output(exc.stderr)
+            terminate_process_group(process.pid)
+            with suppress(subprocess.TimeoutExpired):
+                remaining_stdout, remaining_stderr = process.communicate(timeout=1)
+                stdout_text += _decode_process_output(remaining_stdout)
+                stderr_text += _decode_process_output(remaining_stderr)
+            error = "Python execution timed out"
+            error_type = "TimeoutError"
+
+        if error is None and process.returncode != 0:
+            error, error_type = _infer_python_error(stderr_text, process.returncode)
+
+    except Exception as exc:
+        error = f"Python execution failed: {str(exc)}"
+        error_type = type(exc).__name__
+        if process is not None:
+            terminate_process_group(process.pid)
 
     execution_time = round(time.monotonic() - start_time, 4)
 
@@ -370,8 +438,8 @@ def execute_code(code: str) -> dict[str, Any]:
     files = collect_output_files()
 
     return build_result(
-        stdout=stdout_capture.getvalue(),
-        stderr=stderr_capture.getvalue(),
+        stdout=stdout_text,
+        stderr=stderr_text,
         error=error,
         error_type=error_type,
         files=files,
@@ -503,7 +571,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Code Executor")
     parser.add_argument("--lang", type=str, choices=["python", "bash"], default="python", help="Language to execute")
     parser.add_argument("--exec-id", type=str, default=None, help="Unique execution identifier for output isolation")
+    parser.add_argument("--python-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.python_child:
+        execute_python_child()
+        return
 
     exec_id = args.exec_id or uuid.uuid4().hex[:12]
     MISC_DIR = Path(f"/tmp/misc/{exec_id}")

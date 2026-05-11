@@ -60,12 +60,10 @@ SANDBOX_MEM_LIMIT = os.getenv("SANDBOX_MEM_LIMIT", "512m")
 SANDBOX_CPU_PERIOD = int(os.getenv("SANDBOX_CPU_PERIOD", "100000"))
 SANDBOX_CPU_QUOTA = int(os.getenv("SANDBOX_CPU_QUOTA", "100000"))
 SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
-SANDBOX_TMPFS_SIZE = os.getenv("SANDBOX_TMPFS_SIZE", "100m")
-SANDBOX_MPL_CACHE_TMPFS_SIZE = os.getenv("SANDBOX_MPL_CACHE_TMPFS_SIZE", "32m")
-SANDBOX_MISC_TMPFS_SIZE = os.getenv("SANDBOX_MISC_TMPFS_SIZE", "128m")
+SANDBOX_TMP_ROOT_SIZE = os.getenv("SANDBOX_TMP_ROOT_SIZE", "512m")
 SANDBOX_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "128m")
 SANDBOX_HOME_TMPFS_SIZE = os.getenv("SANDBOX_HOME_TMPFS_SIZE", "256m")
-SANDBOX_READ_ONLY_ROOTFS = str_to_bool(os.getenv("SANDBOX_READ_ONLY_ROOTFS", "false"))
+SANDBOX_READ_ONLY_ROOTFS = str_to_bool(os.getenv("SANDBOX_READ_ONLY_ROOTFS", "true"))
 SANDBOX_NETWORK_MODE = os.getenv("SANDBOX_NETWORK_MODE", "none")
 SANDBOX_UID = int(os.getenv("SANDBOX_UID", "10001"))
 SANDBOX_GID = int(os.getenv("SANDBOX_GID", "10001"))
@@ -100,6 +98,7 @@ JWT_TENANT_CLAIM = os.getenv("JWT_TENANT_CLAIM", "tenant_id")
 MAX_INPUT_FILES = int(os.getenv("MAX_INPUT_FILES", "10"))
 MAX_INPUT_FILE_SIZE = int(os.getenv("MAX_INPUT_FILE_SIZE", str(5 * 1024 * 1024)))
 MAX_INPUT_TOTAL_SIZE = int(os.getenv("MAX_INPUT_TOTAL_SIZE", str(20 * 1024 * 1024)))
+MAX_REQUEST_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_SIZE", str(32 * 1024 * 1024)))
 MAX_FILE_NAME_LENGTH = int(os.getenv("MAX_FILE_NAME_LENGTH", "128"))
 MAX_PIP_PACKAGES = int(os.getenv("MAX_PIP_PACKAGES", "5"))
 MAX_PIP_PACKAGE_NAME_LENGTH = int(os.getenv("MAX_PIP_PACKAGE_NAME_LENGTH", "64"))
@@ -176,6 +175,10 @@ class ExecutorOutputError(ValueError):
     """Raised when the sandbox executor output cannot be parsed safely."""
 
 
+class RequestBodyTooLarge(ValueError):
+    """Raised when an incoming request body exceeds the configured limit."""
+
+
 execution_semaphore: asyncio.Semaphore
 docker_client: docker.DockerClient
 state_backend: StateBackend
@@ -245,6 +248,9 @@ def validate_runtime_configuration() -> None:
     """Validate runtime configuration settings and raise RuntimeError if invalid."""
     if DEFAULT_TIMEOUT > MAX_TIMEOUT:
         raise RuntimeError("DEFAULT_TIMEOUT must be less than or equal to MAX_TIMEOUT")
+
+    if MAX_REQUEST_BODY_SIZE < 1:
+        raise RuntimeError("MAX_REQUEST_BODY_SIZE must be at least 1 byte")
 
     if REQUIRE_AUTH and not (JWT_SECRET or STATIC_API_KEYS):
         raise RuntimeError(
@@ -739,31 +745,113 @@ if ENABLE_CORS and CORS_ALLOW_ORIGINS:
     )
 
 
+def metrics_path_label(request: Request) -> str:
+    """Return a low-cardinality path label for metrics."""
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if route_path:
+        return str(route_path)
+    return "__unmatched__"
+
+
+def request_content_length_exceeds_limit(request: Request) -> bool:
+    """Check Content-Length against the configured request body limit."""
+    raw_content_length = request.headers.get("content-length")
+    if not raw_content_length:
+        return False
+    try:
+        return int(raw_content_length) > MAX_REQUEST_BODY_SIZE
+    except ValueError:
+        return False
+
+
+def limited_receive_factory(receive, *, max_bytes: int):
+    """Wrap an ASGI receive callable and reject bodies that exceed max_bytes."""
+    received_bytes = 0
+
+    async def limited_receive():
+        nonlocal received_bytes
+        message = await receive()
+        if message.get("type") != "http.request":
+            return message
+
+        body = message.get("body", b"")
+        received_bytes += len(body)
+        if received_bytes > max_bytes:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds maximum size of {max_bytes} bytes"
+            )
+        return message
+
+    return limited_receive
+
+
 @app.middleware("http")
 async def request_metrics_middleware(request: Request, call_next):
     """Middleware to track request metrics and add request ID to responses."""
     request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = request_id
     start = time.monotonic()
+    limited_methods = {"POST", "PUT", "PATCH"}
+
+    if request.method in limited_methods and request_content_length_exceeds_limit(request):
+        elapsed = time.monotonic() - start
+        path_label = metrics_path_label(request)
+        REQUEST_COUNTER.labels(request.method, path_label, "413").inc()
+        REQUEST_LATENCY.labels(request.method, path_label).observe(elapsed)
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE} bytes."
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    if request.method in limited_methods:
+        request._receive = limited_receive_factory(  # noqa: SLF001 - Starlette exposes no public receive setter.
+            request.receive,
+            max_bytes=MAX_REQUEST_BODY_SIZE,
+        )
 
     try:
         response = await call_next(request)
-    except Exception:
+    except RequestBodyTooLarge:
         elapsed = time.monotonic() - start
-        REQUEST_COUNTER.labels(
+        path_label = metrics_path_label(request)
+        REQUEST_COUNTER.labels(request.method, path_label, "413").inc()
+        REQUEST_LATENCY.labels(request.method, path_label).observe(elapsed)
+        logger.warning(
+            "[%s] %s %s rejected after %.3fs: request body too large",
+            request_id,
             request.method,
             request.url.path,
+            elapsed,
+        )
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE} bytes."
+            },
+            headers={"X-Request-ID": request_id},
+        )
+    except Exception:
+        elapsed = time.monotonic() - start
+        path_label = metrics_path_label(request)
+        REQUEST_COUNTER.labels(
+            request.method,
+            path_label,
             "500",
         ).inc()
-        REQUEST_LATENCY.labels(request.method, request.url.path).observe(elapsed)
+        REQUEST_LATENCY.labels(request.method, path_label).observe(elapsed)
         logger.exception("[%s] %s %s failed after %.3fs", request_id, request.method, request.url.path, elapsed)
         raise
 
     elapsed = time.monotonic() - start
     status_code = str(response.status_code)
     response.headers["X-Request-ID"] = request_id
-    REQUEST_COUNTER.labels(request.method, request.url.path, status_code).inc()
-    REQUEST_LATENCY.labels(request.method, request.url.path).observe(elapsed)
+    path_label = metrics_path_label(request)
+    REQUEST_COUNTER.labels(request.method, path_label, status_code).inc()
+    REQUEST_LATENCY.labels(request.method, path_label).observe(elapsed)
     logger.info(
         "[%s] %s %s -> %s in %.3fs",
         request_id,
@@ -808,7 +896,7 @@ class ExecuteRequest(BaseModel):
         le=MAX_TIMEOUT,
     )
     enable_network: Optional[bool] = Field(
-        default=True,
+        default=False,
         description="Whether to enable network access in the sandbox",
     )
     pip_packages: list[str] = Field(
@@ -884,7 +972,7 @@ class ExecuteResponse(BaseModel):
 
 
 class CreateContainerRequest(BaseModel):
-    enable_network: bool = True
+    enable_network: bool = False
     inject_sandbox_env: bool = False
 
 
@@ -1037,9 +1125,7 @@ def build_tmpfs_config() -> dict[str, str]:
     owner = f"uid={SANDBOX_UID},gid={SANDBOX_GID}"
     return {
         "/home/sandbox": f"size={SANDBOX_HOME_TMPFS_SIZE},mode=0700,{owner}",
-        "/tmp/output": f"size={SANDBOX_TMPFS_SIZE},mode=1777,{owner}",
-        "/tmp/mpl_cache": f"size={SANDBOX_MPL_CACHE_TMPFS_SIZE},mode=1777,{owner}",
-        "/tmp/misc": f"size={SANDBOX_MISC_TMPFS_SIZE},mode=1777,{owner}",
+        "/tmp": f"size={SANDBOX_TMP_ROOT_SIZE},mode=1777,{owner}",
     }
 
 
@@ -1055,6 +1141,7 @@ async def create_container_session(
 
     execution_id = str(uuid.uuid4())[:12]
     network_mode = SANDBOX_NETWORK_MODE if enable_network else "none"
+    network_enabled = network_mode != "none"
 
     security_opts = ["no-new-privileges:true"]
     if not USE_DOCKER_DEFAULT_SECCOMP:
@@ -1089,7 +1176,6 @@ async def create_container_session(
             "inject-sandbox-env": "1" if inject_sandbox_env else "0",
         },
         "name": f"sandbox-{execution_id}",
-        # Docker archive uploads for input files and `.env` injection require a writable rootfs.
         "read_only": SANDBOX_READ_ONLY_ROOTFS,
         "security_opt": security_opts,
         "user": f"{SANDBOX_UID}:{SANDBOX_GID}",
@@ -1120,7 +1206,7 @@ async def create_container_session(
     session = SessionInfo(
         created_at=now,
         last_activity=now,
-        network_enabled=enable_network,
+        network_enabled=network_enabled,
         owner_subject=auth.subject,
         owner_tenant=auth.tenant,
         docker_daemon_id=local_docker_daemon_id,
@@ -1301,7 +1387,7 @@ async def create_container(
     auth: AuthContext = Depends(verify_auth),
 ):
     """Create a new sandbox container session."""
-    enable_network = request.enable_network if request else True
+    enable_network = request.enable_network if request else False
     inject_sandbox_env = request.inject_sandbox_env if request else False
     if inject_sandbox_env and not ALLOW_SANDBOX_ENV_INJECTION:
         raise HTTPException(status_code=400, detail="Sandbox env injection is disabled.")
