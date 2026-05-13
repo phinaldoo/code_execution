@@ -203,6 +203,76 @@ class GatewaySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.stdout, "new")
         self.assertIsNone(result.error)
 
+    async def test_run_code_in_sandbox_provisions_input_files_via_exec(self) -> None:
+        await self.state_backend.save_session(
+            "ctr-1",
+            SessionInfo(
+                created_at=1.0,
+                last_activity=1.0,
+                network_enabled=False,
+                owner_subject="subject-1",
+                owner_tenant=None,
+                docker_daemon_id="daemon-local",
+            ),
+            session_timeout_seconds=60,
+        )
+
+        fake_container = SimpleNamespace(id="ctr-1")
+        gateway_app.docker_client = SimpleNamespace(
+            containers=SimpleNamespace(get=mock.Mock(return_value=fake_container)),
+            api=SimpleNamespace(exec_create=mock.Mock(return_value={"Id": "exec-1"})),
+        )
+
+        raw_output = (
+            '__EXECUTOR_RESULT__:{"stdout":"ok","stderr":"","error":null,'
+            '"error_type":null,"files":[],"execution_time":0.1}'
+        )
+        with mock.patch.object(
+            gateway_app,
+            "provision_files_in_container",
+            mock.AsyncMock(),
+        ) as provision_mock:
+            with mock.patch.object(
+                gateway_app,
+                "run_exec_with_timeout",
+                mock.AsyncMock(return_value=(raw_output, 0, False)),
+            ):
+                result = await gateway_app.run_code_in_sandbox(
+                    container_id="ctr-1",
+                    language="python",
+                    code="print('ok')",
+                    timeout=10,
+                    execution_id="exec-123",
+                    files=[gateway_app.FileInput(name="input.txt", content="aGVsbG8=")],
+                )
+
+        self.assertEqual(result.stdout, "ok")
+        provision_mock.assert_awaited_once()
+        self.assertIs(provision_mock.await_args.args[0], fake_container)
+        self.assertEqual(provision_mock.await_args.kwargs["target_dir"], "/home/sandbox")
+        self.assertEqual(provision_mock.await_args.kwargs["files"][0].name, "input.txt")
+
+    async def test_ensure_sandbox_env_file_provisions_via_exec(self) -> None:
+        fake_container = SimpleNamespace(id="ctr-1")
+
+        with mock.patch.object(gateway_app, "_read_env_source_bytes", return_value=b"SECRET=1\n"):
+            with mock.patch.object(
+                gateway_app,
+                "provision_files_in_container",
+                mock.AsyncMock(),
+            ) as provision_mock:
+                await gateway_app.ensure_sandbox_env_file(
+                    fake_container,
+                    inject_sandbox_env=True,
+                )
+
+        provision_mock.assert_awaited_once()
+        self.assertIs(provision_mock.await_args.args[0], fake_container)
+        self.assertEqual(provision_mock.await_args.kwargs["target_dir"], "/home/sandbox")
+        provisioned = provision_mock.await_args.kwargs["files"]
+        self.assertEqual(provisioned[0].name, ".env")
+        self.assertEqual(provisioned[0].content, b"SECRET=1\n")
+
 
 class GatewayConfigurationTests(unittest.TestCase):
     def _base_overrides(self, **extra):

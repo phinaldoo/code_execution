@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -31,6 +32,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field, field_validator
+from docker.utils.socket import frames_iter
 
 from state import InMemoryStateBackend, RedisStateBackend, SessionInfo, StateBackend
 
@@ -125,6 +127,36 @@ SANDBOX_ENV_TARGET_PATH = os.getenv("SANDBOX_ENV_TARGET_PATH", "/home/sandbox/.e
 _DEFAULT_ENV_SANDBOX_SOURCE = str(Path(__file__).resolve().parents[1] / ".env_sandbox")
 SANDBOX_ENV_SOURCE_PATH = os.getenv("SANDBOX_ENV_SOURCE_PATH", _DEFAULT_ENV_SANDBOX_SOURCE)
 EXECUTOR_RESULT_PREFIX = "__EXECUTOR_RESULT__:"
+FILE_PROVISION_TIMEOUT = int(os.getenv("FILE_PROVISION_TIMEOUT", "30"))
+FILE_PROVISION_SCRIPT = r"""
+import os
+import shutil
+import sys
+import tarfile
+from pathlib import Path
+
+target_root = Path(os.environ["TARGET_DIR"]).resolve()
+target_root.mkdir(parents=True, exist_ok=True)
+
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as tar:
+    for member in tar:
+        member_name = member.name
+        destination = (target_root / member_name).resolve()
+        if destination != target_root and target_root not in destination.parents:
+            raise RuntimeError(f"Archive member escapes target directory: {member_name}")
+        if member.isdir():
+            destination.mkdir(mode=member.mode or 0o700, parents=True, exist_ok=True)
+            continue
+        if not member.isfile():
+            raise RuntimeError(f"Unsupported archive member type: {member_name}")
+        source = tar.extractfile(member)
+        if source is None:
+            raise RuntimeError(f"Unable to read archive member: {member_name}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as output:
+            shutil.copyfileobj(source, output)
+        os.chmod(destination, member.mode or 0o600)
+"""
 
 
 logging.basicConfig(
@@ -1054,6 +1086,95 @@ def create_tar_archive_from_files(files: list[PreparedFile]) -> bytes:
     return tar_stream.getvalue()
 
 
+def _write_to_exec_socket(exec_socket: Any, data: bytes) -> None:
+    """Write bytes to a Docker exec hijack socket and close its stdin side."""
+    writable = getattr(exec_socket, "_sock", exec_socket)
+    if hasattr(writable, "sendall"):
+        writable.sendall(data)
+    elif hasattr(writable, "write"):
+        writable.write(data)
+        flush = getattr(writable, "flush", None)
+        if flush:
+            flush()
+    else:
+        os.write(writable.fileno(), data)
+
+    with suppress(Exception):
+        writable.shutdown(socket.SHUT_WR)
+
+
+def _run_exec_with_stdin(
+    *,
+    exec_id: str,
+    input_bytes: bytes,
+) -> tuple[bytes, bytes, int]:
+    """Run a Docker exec command, streaming bytes to stdin and collecting output."""
+    exec_socket = docker_client.api.exec_start(exec_id, socket=True)
+    stdout_parts: list[bytes] = []
+    stderr_parts: list[bytes] = []
+
+    try:
+        _write_to_exec_socket(exec_socket, input_bytes)
+        for stream_type, chunk in frames_iter(exec_socket, tty=False):
+            if stream_type == 2:
+                stderr_parts.append(chunk)
+            else:
+                stdout_parts.append(chunk)
+    finally:
+        close = getattr(exec_socket, "close", None)
+        if close:
+            with suppress(Exception):
+                close()
+
+    inspect_result = docker_client.api.exec_inspect(exec_id)
+    return b"".join(stdout_parts), b"".join(stderr_parts), int(inspect_result.get("ExitCode", 0) or 0)
+
+
+async def provision_files_in_container(
+    container: docker.models.containers.Container,
+    *,
+    target_dir: str,
+    files: list[PreparedFile],
+) -> None:
+    """Copy prepared files into a writable sandbox path without Docker's archive API."""
+    if not files:
+        return
+
+    tar_data = create_tar_archive_from_files(files)
+    exec_info = await asyncio.to_thread(
+        docker_client.api.exec_create,
+        container.id,
+        cmd=["python", "-c", FILE_PROVISION_SCRIPT],
+        stdin=True,
+        stdout=True,
+        stderr=True,
+        environment={"TARGET_DIR": target_dir},
+        user=f"{SANDBOX_UID}:{SANDBOX_GID}",
+        workdir="/home/sandbox",
+    )
+
+    try:
+        stdout, stderr, exit_code = await asyncio.wait_for(
+            asyncio.to_thread(
+                _run_exec_with_stdin,
+                exec_id=exec_info["Id"],
+                input_bytes=tar_data,
+            ),
+            timeout=FILE_PROVISION_TIMEOUT,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"Timed out while provisioning files into sandbox path {target_dir}"
+        ) from exc
+
+    if exit_code != 0:
+        details = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        suffix = f": {details}" if details else ""
+        raise RuntimeError(
+            f"File provisioning into sandbox path {target_dir} failed with code {exit_code}{suffix}"
+        )
+
+
 def prepare_files(files: list[FileInput]) -> list[PreparedFile]:
     """Validate and decode base64-encoded file inputs, returning prepared files."""
     prepared: list[PreparedFile] = []
@@ -1112,10 +1233,11 @@ async def ensure_sandbox_env_file(
 
     try:
         target = Path(SANDBOX_ENV_TARGET_PATH)
-        tar_data = create_tar_archive_from_files(
-            [PreparedFile(name=target.name, content=env_bytes)]
+        await provision_files_in_container(
+            container,
+            target_dir=str(target.parent),
+            files=[PreparedFile(name=target.name, content=env_bytes)],
         )
-        await asyncio.to_thread(container.put_archive, str(target.parent), tar_data)
     except Exception as exc:
         raise RuntimeError(f"Failed to provision sandbox .env file: {exc}") from exc
 
@@ -1302,8 +1424,11 @@ async def run_code_in_sandbox(
 
     if prepared_files:
         try:
-            tar_data = create_tar_archive_from_files(prepared_files)
-            await asyncio.to_thread(container.put_archive, "/home/sandbox", tar_data)
+            await provision_files_in_container(
+                container,
+                target_dir="/home/sandbox",
+                files=prepared_files,
+            )
         except Exception as exc:
             logger.error("[%s] Failed to upload files: %s", execution_id, exc)
             return build_execution_error_response(
