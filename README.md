@@ -23,7 +23,7 @@ Do not expose this service to arbitrary hostile users unless you add stronger is
 - Can run Playwright Chromium inside the sandbox image.
 - Enforces memory, CPU, PID, timeout, rate, and concurrency limits.
 - Uses Redis for shared session state and distributed locks in the Compose stack.
-- Exposes health checks and Prometheus metrics.
+- Exposes version metadata, health checks, and Prometheus metrics.
 
 ## Architecture
 
@@ -120,6 +120,12 @@ Check health:
 
 ```bash
 curl -sS http://localhost:8000/healthz
+```
+
+Check the running gateway and execution contract version:
+
+```bash
+curl -sS http://localhost:8000/version
 ```
 
 Create a sandbox session:
@@ -320,6 +326,14 @@ When enabled, clients may send up to `MAX_PIP_PACKAGES` package specifiers in `p
 For untrusted workloads, prefer baking required packages into the sandbox image instead of allowing runtime installs.
 
 ## Health And Metrics
+
+Version metadata:
+
+```text
+GET /version
+```
+
+The version endpoint returns the gateway release version, tag, API contract version, active execution version, supported execution versions, and feature flags. Normal responses also include `X-Code-Execution-Version` and `X-Code-Execution-Version-Tag` headers.
 
 Unauthenticated lightweight health:
 

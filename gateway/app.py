@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator
 from docker.utils.socket import frames_iter
 
 from state import InMemoryStateBackend, RedisStateBackend, SessionInfo, StateBackend
+from version import APP_VERSION, APP_VERSION_TAG, get_version_payload
 
 
 def str_to_bool(value: Optional[str], default: bool = True) -> bool:
@@ -763,7 +764,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Code Execution Gateway",
     description="Secure, isolated Python code execution service for LLM models",
-    version="1.1.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -881,6 +882,8 @@ async def request_metrics_middleware(request: Request, call_next):
     elapsed = time.monotonic() - start
     status_code = str(response.status_code)
     response.headers["X-Request-ID"] = request_id
+    response.headers["X-Code-Execution-Version"] = APP_VERSION
+    response.headers["X-Code-Execution-Version-Tag"] = APP_VERSION_TAG
     path_label = metrics_path_label(request)
     REQUEST_COUNTER.labels(request.method, path_label, status_code).inc()
     REQUEST_LATENCY.labels(request.method, path_label).observe(elapsed)
@@ -1006,6 +1009,25 @@ class ExecuteResponse(BaseModel):
 class CreateContainerRequest(BaseModel):
     enable_network: bool = False
     inject_sandbox_env: bool = False
+
+
+@app.get("/")
+async def root() -> JSONResponse:
+    """Service information endpoint."""
+    return JSONResponse(
+        {
+            "message": "Code Execution Gateway",
+            "version": APP_VERSION_TAG,
+            "execute_endpoint": "/execute",
+            "version_endpoint": "/version",
+        }
+    )
+
+
+@app.get("/version")
+async def version() -> JSONResponse:
+    """Application and execution contract version endpoint."""
+    return JSONResponse(get_version_payload())
 
 
 def build_execution_error_response(

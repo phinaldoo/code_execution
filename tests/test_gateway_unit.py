@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import json
 import sys
 import time
 import unittest
@@ -359,6 +360,47 @@ class GatewayConfigurationTests(unittest.TestCase):
 
     def test_create_container_request_network_defaults_to_off(self) -> None:
         self.assertFalse(gateway_app.CreateContainerRequest().enable_network)
+
+
+class GatewayVersionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_root_returns_service_metadata(self) -> None:
+        response = await gateway_app.root()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "message": "Code Execution Gateway",
+                "version": gateway_app.APP_VERSION_TAG,
+                "execute_endpoint": "/execute",
+                "version_endpoint": "/version",
+            },
+        )
+        self.assertEqual(gateway_app.app.version, gateway_app.APP_VERSION)
+
+    async def test_version_endpoint_returns_execution_metadata(self) -> None:
+        response = await gateway_app.version()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "version": gateway_app.APP_VERSION,
+                "tag": gateway_app.APP_VERSION_TAG,
+                "api_contract_version": 1,
+                "beta": False,
+                "active_execution_version": "v1",
+                "default_execution_version": "v1",
+                "supported_execution_versions": ["v1"],
+                "available_execution_versions": ["v1"],
+                "features": {
+                    "gateway_version_headers": True,
+                    "persistent_sessions": True,
+                    "input_files": True,
+                    "pip_packages": True,
+                },
+            },
+        )
 
 
 class FilePreparationTests(unittest.TestCase):

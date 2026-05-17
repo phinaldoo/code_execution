@@ -32,9 +32,26 @@ jobs:
       - name: Install gateway test dependencies
         run: python -m pip install -r gateway/requirements.txt
       - name: Compile Python sources
-        run: python -m compileall gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py
+        run: python -m compileall gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py .github/scripts
       - name: Run unit tests
         run: python -m unittest -q tests/test_gateway_unit.py
+      - name: Validate version metadata
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          root = pathlib.Path.cwd()
+          payload = json.loads((root / "gateway/version.json").read_text(encoding="utf-8"))
+          version = payload.get("version")
+          tag = payload.get("tag")
+          if not isinstance(version, str) or not re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", version):
+              raise SystemExit(f"Invalid version payload: {payload}")
+          if tag != f"v{version}":
+              raise SystemExit(f"Version tag mismatch: {payload}")
+          print(f"Validated version {version}")
+          PY
       - name: Run Bandit
         run: bandit -q -r gateway sandbox
       - name: Audit gateway dependencies

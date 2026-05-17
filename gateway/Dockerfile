@@ -26,6 +26,7 @@ RUN groupadd -r gateway && \
 
 # --- Application ---
 COPY *.py /app/
+COPY version.json /app/version.json
 WORKDIR /app
 
 # --- Environment ---

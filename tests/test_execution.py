@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import base64
+import re
 import sys
 import time
 
@@ -71,6 +72,18 @@ def test_health_details():
     assert "docker_connected" in data, data
     assert "state_backend_healthy" in data, data
     return True, "Detailed health endpoint passed"
+
+
+def test_version():
+    """Test version metadata endpoint."""
+    status, data = CLIENT.request("GET", "/version", timeout=10)
+    assert status == 200, data
+    assert re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", data["version"]), data
+    assert data["tag"] == f"v{data['version']}", data
+    assert data["api_contract_version"] == 1, data
+    assert data["active_execution_version"] == "v1", data
+    assert "v1" in data["supported_execution_versions"], data
+    return True, f"Version endpoint passed ({data['tag']})"
 
 
 def test_simple_print():
@@ -266,6 +279,7 @@ def test_background_process_cleanup():
 TESTS = [
     ("Health Check", test_health),
     ("Health Details", test_health_details),
+    ("Version", test_version),
     ("Simple Print", test_simple_print),
     ("Math Computation", test_math),
     ("Matplotlib Plot", test_matplotlib_plot),
