@@ -284,6 +284,7 @@ class GatewayConfigurationTests(unittest.TestCase):
             "JWT_SECRET": None,
             "STATIC_API_KEYS": [],
             "ENABLE_CORS": False,
+            "ENABLE_DOCS": False,
             "IS_PRODUCTION": False,
             "DOCKER_HOST": "",
             "USE_DOCKER_DEFAULT_SECCOMP": True,
@@ -325,6 +326,24 @@ class GatewayConfigurationTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(gateway_app, name, value))
 
             with self.assertRaisesRegex(RuntimeError, "dedicated remote Docker daemon"):
+                gateway_app.validate_runtime_configuration()
+
+    def test_validate_runtime_configuration_rejects_docs_in_production(self) -> None:
+        overrides = self._base_overrides(
+            REQUIRE_AUTH=True,
+            JWT_SECRET="secret",
+            IS_PRODUCTION=True,
+            ENABLE_DOCS=True,
+            DOCKER_HOST="tcp://remote-docker:2376",
+            REQUIRE_SHARED_STATE=True,
+            REDIS_URL="redis://redis:6379/0",
+        )
+
+        with ExitStack() as stack:
+            for name, value in overrides.items():
+                stack.enter_context(mock.patch.object(gateway_app, name, value))
+
+            with self.assertRaisesRegex(RuntimeError, "ENABLE_DOCS"):
                 gateway_app.validate_runtime_configuration()
 
     def test_validate_runtime_configuration_requires_daemon_visible_seccomp_path(self) -> None:

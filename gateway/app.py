@@ -1,5 +1,5 @@
 """
-Code Execution Gateway — FastAPI service that manages sandbox containers.
+Code Execution Gateway - FastAPI service that manages sandbox containers.
 
 This service exposes authenticated APIs to create isolated sandbox sessions,
 execute code inside them, and retrieve execution artifacts.
@@ -79,6 +79,7 @@ SECCOMP_PROFILE_DAEMON_PATH = (
 ).strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DOCKER_HOST = os.getenv("DOCKER_HOST", "").strip()
+ENABLE_DOCS = str_to_bool(os.getenv("ENABLE_DOCS", "false"))
 
 ENABLE_CORS = str_to_bool(os.getenv("ENABLE_CORS", "true"))
 CORS_ALLOW_ORIGINS = split_csv(os.getenv("CORS_ALLOW_ORIGINS"))
@@ -327,6 +328,8 @@ def validate_runtime_configuration() -> None:
         raise RuntimeError("REDIS_URL must be configured when shared state is required.")
 
     if IS_PRODUCTION:
+        if ENABLE_DOCS:
+            raise RuntimeError("ENABLE_DOCS must be false in production.")
         if not DOCKER_HOST:
             raise RuntimeError("DOCKER_HOST must be configured explicitly in production.")
         if DOCKER_HOST.startswith("unix://"):
@@ -765,6 +768,9 @@ app = FastAPI(
     title="Code Execution Gateway",
     description="Secure, isolated Python code execution service for LLM models",
     version=APP_VERSION,
+    docs_url="/docs" if ENABLE_DOCS else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if ENABLE_DOCS else None,
     lifespan=lifespan,
 )
 

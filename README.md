@@ -1,16 +1,23 @@
 # Code Execution Gateway
 
-Code Execution Gateway is a sub-service of the ChatUI project. It is a Docker deployment for running untrusted Python and Bash code in isolated sandbox sessions.
+Code Execution Gateway is a sub-service of the ChatUI project. It runs untrusted Python and Bash code in isolated Docker sandbox sessions and returns stdout, stderr, structured errors, execution timing, and generated files as JSON.
 
-The project provides a FastAPI gateway that creates and manages sandbox containers, executes submitted code inside those containers, and returns captured stdout, stderr, errors, and generated files as JSON. It is built for LLM and chat UI workflows where a frontend needs a controlled execution backend for data analysis, plotting, browser automation, and short-lived file processing tasks.
+The service is built for LLM and chat UI workflows where the main ChatUI backend should not execute model-generated code directly. Instead, ChatUI calls this external gateway, the gateway creates or reuses a sandbox container, and submitted code runs inside that sandbox.
+
+Technical details:
+
+- **FastAPI gateway** for auth, request validation, rate limits, Docker orchestration, health, metrics, and version metadata.
+- **Docker sandbox image** for Python, Bash, Playwright Chromium, data analysis packages, plotting, document utilities, and output collection.
+- **Redis state backend** for shared session state, distributed locks, and rate limits in multi-replica deployments.
+- **Restricted docker-socket-proxy** for local development access to Docker without mounting the raw socket into the gateway.
 
 ## Important Security Warning
 
 This service uses Docker containers as the sandbox boundary. It does not create a dedicated virtual machine for each sandbox session.
 
-On Linux hosts, sandbox containers share the host kernel. On macOS and Windows Docker Desktop, the containers usually run inside Docker Desktop's hidden Linux VM, but this project still manages Docker containers, not VMs. Treat this as container isolation with hardening, not VM-grade isolation.
+On Linux hosts, sandbox containers share the host kernel. On macOS and Windows Docker Desktop, containers usually run inside Docker Desktop's Linux VM, but this project still manages Docker containers, not VMs. Treat this as hardened container isolation, not VM-grade isolation.
 
-Do not expose this service to arbitrary hostile users unless you add stronger isolation and operational controls. For high-risk workloads, run workers on dedicated disposable hosts or use a stronger boundary such as microVMs, VMs, gVisor, or Kata Containers. Protect Docker daemon access carefully; access to the Docker socket or an overly permissive Docker API proxy can be equivalent to host-level control.
+Do not expose this service to arbitrary hostile users unless you add stronger isolation and operational controls. For high-risk workloads, use dedicated disposable hosts or a stronger boundary such as microVMs, VMs, gVisor, or Kata Containers. Protect Docker daemon access carefully; access to the Docker socket or an overly permissive Docker API proxy can be equivalent to host-level control.
 
 ## What It Does
 
@@ -21,9 +28,11 @@ Do not expose this service to arbitrary hostile users unless you add stronger is
 - Auto-saves Matplotlib figures when Python code calls `plt.show()`.
 - Supports input files uploaded as base64 and output files written to `/tmp/output`.
 - Can run Playwright Chromium inside the sandbox image.
-- Enforces memory, CPU, PID, timeout, rate, and concurrency limits.
+- Supports optional per-request pip installs when explicitly enabled.
+- Supports optional sandbox `.env` injection for trusted workflows.
+- Enforces memory, CPU, PID, timeout, request size, file size, rate, and concurrency limits.
 - Uses Redis for shared session state and distributed locks in the Compose stack.
-- Exposes version metadata, health checks, and Prometheus metrics.
+- Exposes version metadata, health checks, Prometheus metrics, and JSON debug metrics.
 
 ## Architecture
 
@@ -34,7 +43,7 @@ client
   v
 FastAPI gateway
   |
-  | Docker API through restricted docker-socket-proxy
+  | Docker API through restricted docker-socket-proxy or a remote Docker daemon
   v
 sandbox container session
   |
@@ -45,50 +54,200 @@ executor captures output and files
 
 Main components:
 
-- `gateway/app.py` - FastAPI app, auth, rate limits, Docker container lifecycle, execution orchestration, health, and metrics.
+- `gateway/app.py` - FastAPI app, auth, rate limits, Docker container lifecycle, execution orchestration, health, metrics, and version endpoint.
+- `gateway/version.json` - gateway release version used by `/version`, OpenAPI metadata, and version response headers.
 - `gateway/state.py` - in-memory and Redis state backends for sessions, locks, and rate limits.
 - `sandbox/executor.py` - code runner inside each sandbox container.
 - `docker-compose.yml` - local development stack with gateway, Redis, docker socket proxy, and sandbox image build target.
-- `tests/` - unit, smoke, and integration verification scripts.
+- `setup.sh` and `setup.ps1` - cross-platform setup helpers that create or sync `.env` and generate a local API key.
 - `security/seccomp-profile.json` - optional fallback seccomp allowlist profile. The default runtime path uses Docker's default seccomp policy.
+- `tests/` - unit, smoke, integration, Playwright, and feature verification scripts.
 
-## Requirements
+## Setup
 
-- Docker with Docker Compose v2.
-- Python 3.12+ for local test scripts.
-- `openssl` and `python3` for `setup.sh`.
+These instructions are for macOS, Linux, and Windows.
 
-The gateway and sandbox images are built by Docker. Local Python only needs to run tests and helper scripts.
+### Prerequisites
 
-## Quick Start
+- Docker
+  - macOS: install Docker Desktop.
+  - Linux: install Docker Engine and the Docker Compose v2 plugin.
+  - Windows: install Docker Desktop with WSL 2 enabled.
+- Docker Compose v2, available as the `docker compose` command.
+- `make`, optional but recommended for the shortest commands.
+- Python 3.12+, only needed for local unit tests and verification scripts. Docker builds the gateway and sandbox runtime images.
+- PowerShell, only needed for native Windows setup without WSL/Git Bash.
 
-Create local configuration and build the images:
+Check required tools:
+
+macOS/Linux or Windows with WSL/Git Bash:
 
 ```bash
-make setup
-make build
+docker --version
+docker compose version
+python3 --version  # or: python --version
 ```
 
-Start the local stack:
+If you want to use the Makefile path, also check:
 
 ```bash
+make --version
+```
+
+Windows PowerShell:
+
+```powershell
+docker --version
+docker compose version
+python --version
+```
+
+### Option 1: macOS/Linux/Windows With Makefile
+
+Use this path if `make` is installed. On macOS/Linux, `make setup` uses `setup.sh`; on Windows, it uses `setup.ps1`.
+
+```bash
+# Prepare .env and generate API_KEYS if needed
+make setup
+
+# Build the gateway and sandbox images
+make build
+
+# Start the local development stack in the background
 make up
 ```
 
-Check status:
+The service is available at:
+
+- `http://localhost:8000`
+- `http://localhost:8000/healthz`
+- `http://localhost:8000/version`
+
+Useful Makefile commands:
 
 ```bash
-make ps
-make logs
+make setup    # Create or sync .env and generate API_KEYS if needed
+make build    # Build gateway and sandbox images
+make up       # Build and start the local stack
+make down     # Stop containers and remove local stack containers
+make restart  # Restart all services
+make logs     # Follow logs
+make ps       # Show container status
 ```
 
-Stop the stack:
+### Option 2: macOS/Linux Without Makefile
+
+Use this path if you do not have `make` installed or prefer plain shell commands.
 
 ```bash
-make down
+# Prepare .env and generate API_KEYS if needed
+bash ./setup.sh
+
+# Build the gateway and sandbox images
+docker compose --profile local-docker --profile build build
+
+# Start the gateway, Redis, and docker socket proxy
+docker compose --profile local-docker up -d
+
+# Check status
+docker compose --profile local-docker ps
+
+# Follow logs
+docker compose --profile local-docker logs -f
 ```
 
-`make setup` creates `.env` from `.env.example` if needed and generates a local `API_KEYS` secret when one is missing.
+Useful Docker Compose commands:
+
+```bash
+docker compose --profile local-docker --profile build build
+docker compose --profile local-docker up -d
+docker compose --profile local-docker down --remove-orphans
+docker compose --profile local-docker restart
+docker compose --profile local-docker logs -f
+docker compose --profile local-docker ps
+```
+
+### Option 3: Windows PowerShell Without Makefile
+
+Use this path for native Windows setup.
+
+```powershell
+# Prepare .env and generate API_KEYS if needed
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+
+# Build the gateway and sandbox images
+docker compose --profile local-docker --profile build build
+
+# Start the gateway, Redis, and docker socket proxy
+docker compose --profile local-docker up -d
+
+# Check status
+docker compose --profile local-docker ps
+
+# Follow logs
+docker compose --profile local-docker logs -f
+```
+
+Useful Docker Compose commands:
+
+```powershell
+docker compose --profile local-docker --profile build build
+docker compose --profile local-docker up -d
+docker compose --profile local-docker down --remove-orphans
+docker compose --profile local-docker restart
+docker compose --profile local-docker logs -f
+docker compose --profile local-docker ps
+```
+
+### What Setup Creates
+
+`make setup`, `bash ./setup.sh`, and `powershell -ExecutionPolicy Bypass -File .\setup.ps1` do the same preparation:
+
+- Create `.env` from `.env.example` if it does not exist.
+- Add new keys from `.env.example` into an existing `.env`.
+- Generate a secure local `API_KEYS=local:<secret>` value when one is missing, too short, or left as a placeholder.
+
+After setup, review `.env` if you want to change the port, CORS origins, network mode, resource limits, authentication, Redis, Docker daemon target, or production hardening.
+
+### Why Compose Profiles Are Used
+
+The local stack uses two Compose profiles:
+
+- `local-docker` starts the restricted Docker socket proxy used by the gateway in local development.
+- `build` builds the sandbox image. The sandbox service is an image build target and does not stay running.
+
+For local development, use both profiles when building, and use `local-docker` when starting:
+
+```bash
+docker compose --profile local-docker --profile build build
+docker compose --profile local-docker up -d
+```
+
+### Changing the Port
+
+By default, the gateway listens on host port `8000`. To use another port, edit `.env`:
+
+```env
+GATEWAY_PORT=8010
+```
+
+Then restart the stack:
+
+```bash
+make restart
+```
+
+Without Makefile:
+
+```bash
+docker compose --profile local-docker restart
+```
+
+Windows PowerShell:
+
+```powershell
+docker compose --profile local-docker restart
+```
 
 ## Authentication
 
@@ -100,32 +259,31 @@ Static API keys are configured with `API_KEYS`:
 API_KEYS=local:replace-with-a-long-random-secret
 ```
 
-Use the secret portion as the bearer token:
+Use the secret portion after the colon as the Bearer token.
 
-```bash
-TOKEN="replace-with-a-long-random-secret"
-```
-
-The gateway also supports JWT auth when `JWT_SECRET` is configured. JWTs must include `exp` and `sub`; optional issuer, audience, algorithms, and tenant claim are controlled by environment variables.
-
-## API Usage
-
-Set a token first:
+macOS/Linux:
 
 ```bash
 TOKEN="$(grep '^API_KEYS=' .env | cut -d= -f2- | cut -d: -f2-)"
 ```
 
-Check health:
+Windows PowerShell:
 
-```bash
-curl -sS http://localhost:8000/healthz
+```powershell
+$TOKEN = ((Get-Content .env | Where-Object { $_ -like 'API_KEYS=*' } | Select-Object -First 1) -split '=', 2)[1]
+$TOKEN = ($TOKEN -split ':', 2)[1]
 ```
 
-Check the running gateway and execution contract version:
+JWT authentication is also supported. When `JWT_SECRET` is configured, Bearer tokens are first validated as JWTs. If static API keys are also configured, a token that is not a valid JWT can still authenticate as a static API key. JWTs must include `exp` and `sub`; optional issuer, audience, algorithms, and tenant claim are controlled by environment variables.
+
+## API Usage
+
+Check the service:
 
 ```bash
+curl -sS http://localhost:8000/
 curl -sS http://localhost:8000/version
+curl -sS http://localhost:8000/healthz
 ```
 
 Create a sandbox session:
@@ -174,9 +332,37 @@ curl -sS -X DELETE http://localhost:8000/containers/$CONTAINER_ID \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-## Request And Response Shape
+PowerShell examples use `Invoke-RestMethod`:
 
-Create container:
+```powershell
+$Headers = @{ Authorization = "Bearer $TOKEN" }
+$Container = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/containers" -Headers $Headers -ContentType "application/json" -Body '{"enable_network":false}'
+$Body = @{
+    container_id = $Container.container_id
+    language = "python"
+    code = "print('hello from python')"
+    timeout = 30
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/execute" -Headers $Headers -ContentType "application/json" -Body $Body
+Invoke-RestMethod -Method Delete -Uri "http://localhost:8000/containers/$($Container.container_id)" -Headers $Headers
+```
+
+## API Reference
+
+### Endpoints
+
+- `GET /` - service metadata.
+- `GET /version` - release and execution contract metadata.
+- `GET /health` and `GET /healthz` - lightweight health, unauthenticated.
+- `GET /health/details` and `GET /healthz/details` - detailed health, authenticated when `REQUIRE_AUTH=true`.
+- `GET /metrics` - Prometheus metrics, protected by `METRICS_AUTH_REQUIRED`.
+- `GET /metrics/json` - JSON debug counters, authenticated when `REQUIRE_AUTH=true`.
+- `POST /containers` - create a sandbox session.
+- `GET /containers/{container_id}` - inspect a sandbox session.
+- `DELETE /containers/{container_id}` - delete a sandbox session.
+- `POST /execute` - execute Python or Bash in a sandbox session.
+
+### Create Container Request
 
 ```json
 {
@@ -185,7 +371,24 @@ Create container:
 }
 ```
 
-Execute code:
+Notes:
+
+- Network access is fixed when the container session is created. A later `/execute` request cannot safely downgrade an already-networked session.
+- `inject_sandbox_env` only works when `ALLOW_SANDBOX_ENV_INJECTION=true` and the configured source file is readable.
+
+### Create Container Response
+
+```json
+{
+  "container_id": "container-id",
+  "status": "active",
+  "uptime_seconds": 0.0,
+  "last_activity": 1710000000.0,
+  "docker_daemon_id": "daemon-id"
+}
+```
+
+### Execute Request
 
 ```json
 {
@@ -193,6 +396,7 @@ Execute code:
   "language": "python",
   "code": "print('hello')",
   "timeout": 30,
+  "enable_network": false,
   "pip_packages": [],
   "files": [
     {
@@ -203,7 +407,15 @@ Execute code:
 }
 ```
 
-Execution response:
+Notes:
+
+- `language` must be `python` or `bash`.
+- `timeout` is capped by `MAX_TIMEOUT`.
+- `pip_packages` is rejected unless `ALLOW_PIP_INSTALLS=true`.
+- `files` are copied into `/home/sandbox` before execution.
+- Output files must be written under `/tmp/output` inside the sandbox.
+
+### Execute Response
 
 ```json
 {
@@ -219,7 +431,46 @@ Execution response:
 }
 ```
 
-Output files must be written under `/tmp/output` inside the sandbox. Returned file contents are base64 encoded.
+Returned file contents are base64 encoded:
+
+```json
+{
+  "name": "plot.png",
+  "content": "iVBORw0KGgoAAAANSUhEUgAA...",
+  "mime_type": "image/png",
+  "size": 12345,
+  "error": null
+}
+```
+
+### Version Response
+
+`GET /version` returns:
+
+```json
+{
+  "version": "1.1.0",
+  "tag": "v1.1.0",
+  "api_contract_version": 1,
+  "beta": false,
+  "active_execution_version": "v1",
+  "default_execution_version": "v1",
+  "supported_execution_versions": ["v1"],
+  "available_execution_versions": ["v1"],
+  "features": {
+    "gateway_version_headers": true,
+    "persistent_sessions": true,
+    "input_files": true,
+    "pip_packages": true
+  }
+}
+```
+
+Normal responses include:
+
+- `X-Request-ID`
+- `X-Code-Execution-Version`
+- `X-Code-Execution-Version-Tag`
 
 ## Sandbox Behavior
 
@@ -242,11 +493,35 @@ Bash execution details:
 
 The sandbox image includes common packages for data analysis, visualization, browser automation, document handling, and file formats, including NumPy, pandas, SciPy, Matplotlib, seaborn, scikit-learn, SymPy, requests, Playwright, openpyxl, PyYAML, reportlab, and python-docx.
 
-## Security Model
+Sandbox containers use a read-only root filesystem by default. Writable state is limited to bounded tmpfs mounts, primarily `/home/sandbox` for per-session files and `/tmp` for execution scratch space, output collection, and library caches.
 
-This service is designed for untrusted code, but it is still a powerful execution system. Run it with the same care as any sandbox infrastructure.
+## Security
 
-The sandbox is a hardened Docker container, not a VM. Containers provide process, filesystem, namespace, cgroup, and capability isolation, but they share the host kernel on Linux. A kernel vulnerability, container runtime vulnerability, Docker daemon exposure, unsafe host mount, privileged configuration, or overly broad network access can break the intended isolation boundary.
+### Public Exposure Checklist
+
+Do not expose this service to the internet or a shared network until all of the following are true:
+
+- `REQUIRE_AUTH=true` and `API_KEYS` or JWT auth is configured with fresh, long, random secrets created for this deployment.
+- Traffic is protected by TLS at an upstream reverse proxy, load balancer, ingress, or service mesh.
+- `APP_ENV=production`.
+- `ENABLE_DOCS=false`.
+- `REQUIRE_SHARED_STATE=true` and `REDIS_URL` points at a durable, access-controlled Redis deployment.
+- `GATEWAY_DOCKER_HOST` or `DOCKER_HOST` points at a dedicated remote Docker daemon over TLS (`tcp://...:2376`) or SSH (`ssh://...`), not the local socket proxy.
+- `CORS_ALLOW_ORIGINS` is restricted to the real ChatUI origin or origins. Do not use wildcard CORS with credentials.
+- `SANDBOX_NETWORK_MODE=none` unless network access is explicitly required and isolated.
+- `SANDBOX_READ_ONLY_ROOTFS=true`.
+- `ALLOW_PIP_INSTALLS=false` for untrusted workloads.
+- `ALLOW_SANDBOX_ENV_INJECTION=false` unless submitted code is trusted.
+- CPU, memory, PID, request-size, file-size, timeout, session, and rate limits are tuned for your host capacity.
+- Real secrets are stored outside source control and rotated if they were ever shared, logged, or used in another environment.
+
+### Docker Daemon Safety
+
+The gateway creates and executes containers, so Docker daemon access is highly sensitive.
+
+Local development uses `docker-proxy` through `GATEWAY_DOCKER_HOST=tcp://docker-proxy:2375`. This is acceptable only inside the local Compose network. In production, use a dedicated remote Docker daemon or worker pool. The gateway intentionally rejects production configurations that use a raw Unix socket, loopback Docker host, local docker proxy, or plain unencrypted TCP on port `2375`.
+
+### Isolation Model
 
 Implemented controls include:
 
@@ -254,6 +529,7 @@ Implemented controls include:
 - Docker capability drop with `no-new-privileges`.
 - Configurable CPU, memory, PID, shared memory, and tmpfs limits.
 - Optional network isolation with `SANDBOX_NETWORK_MODE=none`.
+- Read-only sandbox root filesystem by default.
 - Per-execution timeout with container teardown on timeout.
 - Per-container execution locks to prevent concurrent mutation of one session.
 - Global execution concurrency limits.
@@ -264,42 +540,118 @@ Implemented controls include:
 - Redis-backed shared state for multi-replica coordination.
 - Prometheus metrics and health endpoints for operations.
 
-Production configuration is intentionally stricter than local development. In `APP_ENV=production`, the gateway requires authentication, shared state, explicit CORS origins, and a remote Docker daemon over TLS or SSH. It rejects raw Unix socket access, local docker proxies, loopback Docker hosts, and plain TCP Docker on port `2375`.
+These controls reduce risk but do not make Docker containers equivalent to VMs.
 
-## Configuration
+### Vulnerability Disclosure
 
-Copy `.env.example` to `.env` with `make setup`, then adjust as needed.
+Please see [SECURITY.md](./SECURITY.md) for details on how to report security vulnerabilities.
 
-Important settings:
+## Configurable Environment Variables
 
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `APP_ENV` | `development` or `production` behavior | `development` |
-| `GATEWAY_PORT` | Host port for the API | `8000` |
-| `API_KEYS` | Comma-separated static keys, optionally `key_id:secret` | empty |
-| `REQUIRE_AUTH` | Require Bearer auth for API endpoints | production-aware |
-| `METRICS_AUTH_REQUIRED` | Require auth for `/metrics` | production-aware |
-| `REDIS_URL` | Shared state backend | `redis://redis:6379/0` |
-| `SANDBOX_IMAGE` | Sandbox image name | `code-sandbox:latest` |
-| `MAX_REQUEST_BODY_SIZE` | Maximum HTTP request body before JSON parsing | `33554432` |
-| `DEFAULT_TIMEOUT` | Default execution timeout in seconds | `30` |
-| `MAX_TIMEOUT` | Maximum accepted timeout | `120` |
-| `MAX_CONCURRENT_EXECUTIONS` | Gateway-wide execution concurrency | `10` |
-| `MAX_ACTIVE_SESSIONS` | Total active session cap | `100` |
-| `MAX_CONTAINERS_PER_PRINCIPAL` | Active session cap per authenticated principal | `3` |
-| `SANDBOX_NETWORK_MODE` | `none` or `bridge` | `none` |
-| `SANDBOX_TMP_ROOT_SIZE` | Bounded tmpfs size for `/tmp` in the sandbox | `512m` |
-| `SANDBOX_READ_ONLY_ROOTFS` | Run sandbox containers with a read-only root filesystem | `true` |
-| `ALLOW_PIP_INSTALLS` | Allow per-request pip installs | `false` |
-| `ALLOW_SANDBOX_ENV_INJECTION` | Allow copying `.env_sandbox` into sessions on request | `false` |
-| `GATEWAY_DOCKER_HOST` | Docker daemon endpoint passed to the gateway as `DOCKER_HOST` | `tcp://docker-proxy:2375` locally |
-| `USE_DOCKER_DEFAULT_SECCOMP` | Use Docker runtime default seccomp | `true` |
-| `REDIS_SOCKET_CONNECT_TIMEOUT` | Redis connect timeout in seconds | `5` |
-| `REDIS_SOCKET_TIMEOUT` | Redis socket timeout in seconds | `5` |
+See `.env.example` for source defaults. `setup.sh` and `setup.ps1` create `.env` from that file and generate `API_KEYS` when needed.
 
-Network access is fixed when the container session is created. A later `/execute` request cannot safely downgrade an already-networked session.
+### Core And Build
 
-Sandbox containers use a read-only root filesystem by default. Writable state is limited to bounded tmpfs mounts, primarily `/home/sandbox` for per-session files and `/tmp` for execution scratch space, output collection, and library caches.
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `APP_ENV` | `development` | Deployment environment. Production guardrails are enforced when this is `production` or `prod`. | Use `development` locally, `staging` before launch, and `production` for live deployments. |
+| `GATEWAY_PORT` | `8000` | Host port mapped to the gateway container's port `8000`. | Keep `8000` locally unless it conflicts. In production, place the service behind TLS infrastructure and expose only required ports. |
+| `LOG_LEVEL` | `INFO` | Gateway Python logging level. | Use `INFO` normally. Use `DEBUG` only for temporary debugging because logs may contain operational details. |
+| `ENABLE_DOCS` | `false` | Enables FastAPI `/docs` and `/openapi.json`. | Keep `false` in production. Enable only for local debugging or restricted non-production environments. |
+| `PYTHON_BASE_IMAGE` | pinned `python:3.12-slim-bookworm` digest | Base image used by the gateway and sandbox Dockerfiles. | Keep pinned for reproducible builds. Update deliberately during maintenance. |
+
+### Authentication
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `REQUIRE_AUTH` | production-aware, `.env.example`: `true` | Requires Bearer authentication for API endpoints. | Keep `true` for anything except isolated local debugging. |
+| `METRICS_AUTH_REQUIRED` | production-aware, `.env.example`: `true` | Requires Bearer authentication for `/metrics`. | Keep `true` outside private local development. |
+| `API_KEYS` | empty until setup | Comma-separated static API keys. Values may be `key_id:secret` or just `secret`. | Let setup generate a local key. Use long random per-environment secrets and rotate by temporarily listing old and new keys. |
+| `API_KEY` | empty | Legacy single-key fallback used only when `API_KEYS` is empty. | Prefer `API_KEYS`. |
+| `JWT_SECRET` | empty | Enables JWT authentication when set. JWTs must include `exp` and `sub`. | Use a strong secret or key material managed by your identity infrastructure. |
+| `JWT_ALGORITHMS` | `HS256` | Comma-separated JWT algorithms accepted by PyJWT. | Keep narrow. Do not accept algorithms you do not issue. |
+| `JWT_ISSUER` | empty | Optional required JWT issuer. | Set in production when using JWT auth. |
+| `JWT_AUDIENCE` | empty | Optional required JWT audience. | Set in production when using JWT auth. |
+| `JWT_TENANT_CLAIM` | `tenant_id` | JWT claim used for tenant scoping. | Match your identity provider and ChatUI tenant model. |
+
+### CORS
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `ENABLE_CORS` | `true` | Enables FastAPI CORS middleware when origins are configured. | Keep enabled when browser clients call the gateway directly. Disable behind a same-origin proxy if not needed. |
+| `CORS_ALLOW_ORIGINS` | `http://localhost:3000` | Comma-separated allowed origins. | Use exact ChatUI origins in production. Do not combine `*` with credentials. |
+| `CORS_ALLOW_METHODS` | `GET,POST,DELETE,OPTIONS` | Comma-separated allowed CORS methods. | Keep minimal. |
+| `CORS_ALLOW_HEADERS` | `Authorization,Content-Type,X-Request-ID` | Comma-separated allowed CORS headers. | Add only headers your clients actually send. |
+| `CORS_ALLOW_CREDENTIALS` | `true` | Allows credentialed browser requests. | Keep `true` only with explicit origins. |
+
+### Docker, State, And Redis
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `GATEWAY_DOCKER_HOST` | `tcp://docker-proxy:2375` locally | Compose variable passed into the gateway as `DOCKER_HOST`. | Use local docker-proxy only for development. In production, point at a dedicated remote daemon over TLS or SSH. |
+| `DOCKER_HOST` | empty in direct process runs | Docker daemon endpoint read by `docker.from_env()` inside the gateway. | For non-Compose deployments, set this directly to a safe remote daemon. |
+| `USE_DOCKER_DEFAULT_SECCOMP` | `true` | Uses Docker runtime default seccomp policy. | Keep `true` unless you have a tested daemon-visible profile. |
+| `SECCOMP_PROFILE_DAEMON_PATH` | empty | Absolute path to a seccomp profile on the Docker daemon host when default seccomp is disabled. `SECCOMP_PROFILE_PATH` is accepted as a legacy alias. | Set only if `USE_DOCKER_DEFAULT_SECCOMP=false`; the path must exist on the daemon host, not merely in this repository. |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for shared sessions, locks, and rate limits. | Use Redis in production and for multi-replica deployments. |
+| `REQUIRE_SHARED_STATE` | production-aware, `.env.example`: `true` | Requires `REDIS_URL` when enabled. | Keep `true` in production. Disable only for single-process local tests. |
+| `REDIS_SOCKET_CONNECT_TIMEOUT` | `5` | Redis connect timeout in seconds. | Lower for quick failure detection; raise only for slow networks. |
+| `REDIS_SOCKET_TIMEOUT` | `5` | Redis socket operation timeout in seconds. | Keep bounded to avoid stuck requests. |
+| `REDIS_HEALTH_CHECK_INTERVAL` | `30` | Redis client health check interval in seconds. | Default is usually fine. |
+
+### Request, File, And Execution Limits
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `MAX_REQUEST_BODY_SIZE` | `33554432` | Maximum HTTP request body size in bytes before JSON parsing. | Keep as small as practical for expected code and input files. |
+| `MAX_INPUT_FILES` | `10` | Maximum number of input files on one execution request. | Keep low for untrusted workloads. |
+| `MAX_INPUT_FILE_SIZE` | `5242880` | Maximum decoded size of one input file in bytes. | Tune for expected uploads; keep below total size. |
+| `MAX_INPUT_TOTAL_SIZE` | `20971520` | Maximum decoded size of all input files in one request. | Keep below `MAX_REQUEST_BODY_SIZE`. |
+| `MAX_FILE_NAME_LENGTH` | `128` | Maximum input file name length. | Keep bounded to simplify logging and filesystem handling. |
+| `DEFAULT_TIMEOUT` | `30` | Default execution timeout in seconds when a request omits `timeout`. | Keep short for interactive chat workflows. |
+| `MAX_TIMEOUT` | `120` | Maximum accepted execution timeout in seconds. | Keep bounded. Increase only for trusted workflows or larger hosts. |
+| `MAX_CONCURRENT_EXECUTIONS` | `10` | Gateway-wide execution concurrency. | Tune to CPU and memory. Lower this before exposing to many users. |
+| `FILE_PROVISION_TIMEOUT` | `30` | Timeout in seconds for copying input files or injected env files into a container. | Keep below normal execution timeout unless large input files require more time. |
+
+### Rate And Session Limits
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `RATE_LIMIT_REQUESTS_PER_WINDOW` | `30` | Per-principal execution request limit per window. | Lower for public or shared deployments. |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Execution rate limit window size in seconds. | Default gives per-minute limits. |
+| `CONTAINER_RATE_LIMIT_REQUESTS_PER_WINDOW` | `10` | Per-principal container creation limit per window. | Keep lower than execution limits because containers are heavier. |
+| `CONTAINER_RATE_LIMIT_WINDOW_SECONDS` | `60` | Container creation rate limit window size in seconds. | Default gives per-minute limits. |
+| `MAX_ACTIVE_SESSIONS` | `100` | Maximum active sessions tracked by the gateway. | Size to host capacity and Redis/state expectations. |
+| `MAX_CONTAINERS_PER_PRINCIPAL` | `3` | Maximum active sessions per authenticated subject and tenant. | Keep small for shared deployments. |
+| `CONTAINER_CREATE_GUARD_TIMEOUT` | `30` | Timeout in seconds while waiting for the serialized container creation guard. | Increase only if Docker is slow during normal operation. |
+
+### Sandbox Runtime
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `SANDBOX_IMAGE` | `code-sandbox:latest` | Docker image used for sandbox sessions. | Use immutable image tags or digests in production. |
+| `SANDBOX_USER` | `sandbox` | User name recorded for sandbox behavior and defaults. | Keep aligned with the sandbox image. |
+| `SANDBOX_UID` | `10001` | Sandbox Linux user ID. | Keep non-root. |
+| `SANDBOX_GID` | `10001` | Sandbox Linux group ID. | Keep non-root. |
+| `SANDBOX_MEM_LIMIT` | `512m` | Docker memory limit for each sandbox session. | Tune for expected code and plotting workloads. |
+| `SANDBOX_CPU_PERIOD` | `100000` | Docker CPU CFS period for sandbox sessions. | Change only if you understand Docker CPU quota controls. |
+| `SANDBOX_CPU_QUOTA` | `100000` | Docker CPU CFS quota for sandbox sessions. Default is about one CPU. | Lower for tighter isolation; raise for trusted heavier jobs. |
+| `SANDBOX_PIDS_LIMIT` | `256` | Maximum process count in each sandbox. | Keep bounded to limit fork-heavy code. |
+| `SANDBOX_TMP_ROOT_SIZE` | `512m` | Bounded tmpfs size for `/tmp` in the sandbox. | Size for temporary execution files and collected outputs. |
+| `SANDBOX_SHM_SIZE` | `128m` | Shared memory size for sandbox containers. | Increase if browser or plotting workloads need more shared memory. |
+| `SANDBOX_HOME_TMPFS_SIZE` | `256m` | Bounded tmpfs size for `/home/sandbox`. | This is per-session persistent scratch space. |
+| `SANDBOX_READ_ONLY_ROOTFS` | `true` | Runs sandbox containers with a read-only root filesystem. | Keep `true` for untrusted workloads. |
+| `SANDBOX_NETWORK_MODE` | `none` | Docker network mode for sandbox sessions. `none` disables network; `bridge` enables network. | Keep `none` for untrusted workloads. Enable `bridge` only when required. |
+
+### Optional Risky Features
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `ALLOW_PIP_INSTALLS` | `false` | Allows clients to request per-execution `pip install --user` before code runs. | Keep `false` for untrusted workloads. Prefer baking packages into the sandbox image. |
+| `MAX_PIP_PACKAGES` | `5` | Maximum package specifiers accepted in one request. | Keep low if pip installs are enabled. |
+| `MAX_PIP_PACKAGE_NAME_LENGTH` | `64` | Maximum length of one package specifier. | Keep bounded to reduce abuse and parsing risk. |
+| `ALLOW_SANDBOX_ENV_INJECTION` | `false` | Allows clients to request copying a configured env file into the sandbox. | Enable only for trusted workflows. |
+| `SANDBOX_ENV_SOURCE_PATH` | repo `.env_sandbox`; Compose overrides to `/etc/code-execution/.env_sandbox` | Source file read by the gateway for sandbox env injection. | Store only sandbox-scoped values here. Never inject host or admin secrets into untrusted sessions. |
+| `SANDBOX_ENV_TARGET_PATH` | `/home/sandbox/.env` | Target path inside the sandbox for injected env values. | Keep under `/home/sandbox`. |
 
 ## Environment Injection
 
@@ -321,7 +673,7 @@ Per-request pip installs are disabled by default:
 ALLOW_PIP_INSTALLS=false
 ```
 
-When enabled, clients may send up to `MAX_PIP_PACKAGES` package specifiers in `pip_packages`. Package names are validated, installed with `pip install --user --no-cache-dir --quiet`, and counted within the execution timeout.
+When enabled, clients may send package specifiers in `pip_packages`. Package names are validated, installed with `pip install --user --no-cache-dir --quiet`, and counted within the execution timeout.
 
 For untrusted workloads, prefer baking required packages into the sandbox image instead of allowing runtime installs.
 
@@ -332,8 +684,6 @@ Version metadata:
 ```text
 GET /version
 ```
-
-The version endpoint returns the gateway release version, tag, API contract version, active execution version, supported execution versions, and feature flags. Normal responses also include `X-Code-Execution-Version` and `X-Code-Execution-Version-Tag` headers.
 
 Unauthenticated lightweight health:
 
@@ -379,15 +729,48 @@ python3 tests/test_execution.py
 python3 tests/verify_features.py
 ```
 
-Optional network tests are skipped unless explicitly enabled:
+Windows PowerShell:
+
+```powershell
+make up
+$env:API_TOKEN = ((Get-Content .env | Where-Object { $_ -like 'API_KEYS=*' } | Select-Object -First 1) -split '=', 2)[1]
+$env:API_TOKEN = ($env:API_TOKEN -split ':', 2)[1]
+
+python tests\verify_vm_flow.py
+python tests\verify_playwright.py
+python tests\test_execution.py
+python tests\verify_features.py
+```
+
+Optional outbound network tests are skipped unless explicitly enabled:
 
 ```bash
 RUN_SANDBOX_NETWORK_TESTS=true python3 tests/test_execution.py
 ```
 
-CI validates Docker Compose config, compiles Python sources, runs unit tests, runs Bandit and pip-audit, builds the local stack, runs integration checks, and scans the gateway and sandbox images with Trivy.
+PowerShell:
 
-## Development Notes
+```powershell
+$env:RUN_SANDBOX_NETWORK_TESTS = "true"
+python tests\test_execution.py
+```
+
+CI validates Docker Compose config, compiles Python sources, runs unit tests, validates version metadata, runs Bandit and pip-audit, builds the local stack, runs integration checks, and scans the gateway and sandbox images with Trivy.
+
+## Operations
+
+Recommended production deployment pattern:
+
+1. Build and publish immutable gateway and sandbox images.
+2. Run the gateway behind TLS infrastructure.
+3. Run Redis as a managed or persistent service.
+4. Run sandbox containers on dedicated worker hosts or a dedicated remote Docker daemon.
+5. Keep Docker daemon credentials and API keys out of source control.
+6. Monitor request rates, execution latency, error rates, `429` responses, active executions, active sessions, Redis health, Docker daemon health, container restarts, memory, CPU, and disk pressure.
+7. Rotate API keys and JWT secrets on a schedule.
+8. Keep base images, Python dependencies, Docker, and host kernels patched.
+
+Development notes:
 
 - Use `make build` after changing `gateway/Dockerfile`, `sandbox/Dockerfile`, requirements, or executor behavior.
 - Use `make restart` after changing Compose-level configuration.
