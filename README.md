@@ -1,8 +1,16 @@
 # Code Execution Gateway
 
-A Docker-backed service for running untrusted Python and Bash code in isolated sandbox sessions.
+Code Execution Gateway is a sub-service of the ChatUI project. It is a Docker deployment for running untrusted Python and Bash code in isolated sandbox sessions.
 
 The project provides a FastAPI gateway that creates and manages sandbox containers, executes submitted code inside those containers, and returns captured stdout, stderr, errors, and generated files as JSON. It is built for LLM and chat UI workflows where a frontend needs a controlled execution backend for data analysis, plotting, browser automation, and short-lived file processing tasks.
+
+## Important Security Warning
+
+This service uses Docker containers as the sandbox boundary. It does not create a dedicated virtual machine for each sandbox session.
+
+On Linux hosts, sandbox containers share the host kernel. On macOS and Windows Docker Desktop, the containers usually run inside Docker Desktop's hidden Linux VM, but this project still manages Docker containers, not VMs. Treat this as container isolation with hardening, not VM-grade isolation.
+
+Do not expose this service to arbitrary hostile users unless you add stronger isolation and operational controls. For high-risk workloads, run workers on dedicated disposable hosts or use a stronger boundary such as microVMs, VMs, gVisor, or Kata Containers. Protect Docker daemon access carefully; access to the Docker socket or an overly permissive Docker API proxy can be equivalent to host-level control.
 
 ## What It Does
 
@@ -231,6 +239,8 @@ The sandbox image includes common packages for data analysis, visualization, bro
 ## Security Model
 
 This service is designed for untrusted code, but it is still a powerful execution system. Run it with the same care as any sandbox infrastructure.
+
+The sandbox is a hardened Docker container, not a VM. Containers provide process, filesystem, namespace, cgroup, and capability isolation, but they share the host kernel on Linux. A kernel vulnerability, container runtime vulnerability, Docker daemon exposure, unsafe host mount, privileged configuration, or overly broad network access can break the intended isolation boundary.
 
 Implemented controls include:
 
