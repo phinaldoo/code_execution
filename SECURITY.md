@@ -8,9 +8,13 @@ Please help us keep ChatUI secure by reporting suspected vulnerabilities respons
 
 **Please do not report security vulnerabilities through public GitHub issues, pull requests, discussions, or comments.**
 
-Instead, please report vulnerabilities privately by contacting us at:
+Instead, please report vulnerabilities privately through GitHub private vulnerability
+reporting for this repository. If you are reviewing a self-hosted deployment,
+use the monitored security contact published by that deployment operator.
 
-**[TODO: Add security contact]**
+Self-hosted operators should publish a dedicated security email or intake form
+before any public beta, and route it to an on-call owner who can triage container
+escape, data exposure, and denial-of-service reports quickly.
 
 Please include as much detail as possible, including:
 

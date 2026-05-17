@@ -17,7 +17,7 @@ This service uses Docker containers as the sandbox boundary. It does not create 
 
 On Linux hosts, sandbox containers share the host kernel. On macOS and Windows Docker Desktop, containers usually run inside Docker Desktop's Linux VM, but this project still manages Docker containers, not VMs. Treat this as hardened container isolation, not VM-grade isolation.
 
-Do not expose this service to arbitrary hostile users unless you add stronger isolation and operational controls. For high-risk workloads, use dedicated disposable hosts or a stronger boundary such as microVMs, VMs, gVisor, or Kata Containers. Protect Docker daemon access carefully; access to the Docker socket or an overly permissive Docker API proxy can be equivalent to host-level control.
+Do not expose this service to arbitrary hostile users unless you add stronger isolation and operational controls. For public beta or high-risk workloads, use dedicated disposable hosts or a stronger boundary such as microVMs, VMs, gVisor, or Kata Containers, then enable `PUBLIC_BETA_MODE=true` so the gateway rejects risky configuration. Protect Docker daemon access carefully; access to the Docker socket or an overly permissive Docker API proxy can be equivalent to host-level control.
 
 ## What It Does
 
@@ -503,15 +503,18 @@ Do not expose this service to the internet or a shared network until all of the 
 
 - `REQUIRE_AUTH=true` and `API_KEYS` or JWT auth is configured with fresh, long, random secrets created for this deployment.
 - Traffic is protected by TLS at an upstream reverse proxy, load balancer, ingress, or service mesh.
-- `APP_ENV=production`.
+- `APP_ENV=production` for controlled live deployments, or `APP_ENV=public_beta` / `PUBLIC_BETA_MODE=true` for arbitrary untrusted beta users.
 - `ENABLE_DOCS=false`.
 - `REQUIRE_SHARED_STATE=true` and `REDIS_URL` points at a durable, access-controlled Redis deployment.
 - `GATEWAY_DOCKER_HOST` or `DOCKER_HOST` points at a dedicated remote Docker daemon over TLS (`tcp://...:2376`) or SSH (`ssh://...`), not the local socket proxy.
 - `CORS_ALLOW_ORIGINS` is restricted to the real ChatUI origin or origins. Do not use wildcard CORS with credentials.
 - `SANDBOX_NETWORK_MODE=none` unless network access is explicitly required and isolated.
+- Public beta deployments configure `SANDBOX_RUNTIME` to a stronger runtime such as gVisor/runsc or Kata Containers and set `REQUIRE_STRONG_SANDBOX_ISOLATION=true`.
+- `SANDBOX_IMAGE` uses an immutable tag or digest, not `latest`.
 - `SANDBOX_READ_ONLY_ROOTFS=true`.
 - `ALLOW_PIP_INSTALLS=false` for untrusted workloads.
 - `ALLOW_SANDBOX_ENV_INJECTION=false` unless submitted code is trusted.
+- `SESSION_TIMEOUT_SECONDS`, `MAX_SESSION_LIFETIME_SECONDS`, and `MAX_EXECUTIONS_PER_SESSION` are set to realistic abuse budgets.
 - CPU, memory, PID, request-size, file-size, timeout, session, and rate limits are tuned for your host capacity.
 - Real secrets are stored outside source control and rotated if they were ever shared, logged, or used in another environment.
 
@@ -540,7 +543,7 @@ Implemented controls include:
 - Redis-backed shared state for multi-replica coordination.
 - Prometheus metrics and health endpoints for operations.
 
-These controls reduce risk but do not make Docker containers equivalent to VMs.
+These controls reduce risk but do not make Docker's default container runtime equivalent to VMs. Use a stronger runtime or dedicated disposable worker hosts before accepting arbitrary public users.
 
 ### Vulnerability Disclosure
 
@@ -554,7 +557,8 @@ See `.env.example` for source defaults. `setup.sh` and `setup.ps1` create `.env`
 
 | Variable | Default | Description | Best practices |
 | --- | --- | --- | --- |
-| `APP_ENV` | `development` | Deployment environment. Production guardrails are enforced when this is `production` or `prod`. | Use `development` locally, `staging` before launch, and `production` for live deployments. |
+| `APP_ENV` | `development` | Deployment environment. Production guardrails are enforced when this is `production` or `prod`; public beta guardrails are enabled when this is `public_beta`, `public-beta`, or `beta`. | Use `development` locally, `staging` before launch, `production` for controlled live deployments, and `public_beta` only with stronger sandbox isolation. |
+| `PUBLIC_BETA_MODE` | `false` | Enables strict public beta validation regardless of `APP_ENV`. | Set `true` before exposing arbitrary untrusted beta users. This requires no sandbox network, no pip installs, no env injection, immutable images, and a stronger runtime. |
 | `GATEWAY_PORT` | `8000` | Host port mapped to the gateway container's port `8000`. | Keep `8000` locally unless it conflicts. In production, place the service behind TLS infrastructure and expose only required ports. |
 | `LOG_LEVEL` | `INFO` | Gateway Python logging level. | Use `INFO` normally. Use `DEBUG` only for temporary debugging because logs may contain operational details. |
 | `ENABLE_DOCS` | `false` | Enables FastAPI `/docs` and `/openapi.json`. | Keep `false` in production. Enable only for local debugging or restricted non-production environments. |
@@ -590,6 +594,7 @@ See `.env.example` for source defaults. `setup.sh` and `setup.ps1` create `.env`
 | --- | --- | --- | --- |
 | `GATEWAY_DOCKER_HOST` | `tcp://docker-proxy:2375` locally | Compose variable passed into the gateway as `DOCKER_HOST`. | Use local docker-proxy only for development. In production, point at a dedicated remote daemon over TLS or SSH. |
 | `DOCKER_HOST` | empty in direct process runs | Docker daemon endpoint read by `docker.from_env()` inside the gateway. | For non-Compose deployments, set this directly to a safe remote daemon. |
+| `DOCKER_CLIENT_TIMEOUT` | `30` | Docker API client timeout in seconds. | Keep bounded so Docker API hangs do not pin request workers indefinitely. |
 | `USE_DOCKER_DEFAULT_SECCOMP` | `true` | Uses Docker runtime default seccomp policy. | Keep `true` unless you have a tested daemon-visible profile. |
 | `SECCOMP_PROFILE_DAEMON_PATH` | empty | Absolute path to a seccomp profile on the Docker daemon host when default seccomp is disabled. `SECCOMP_PROFILE_PATH` is accepted as a legacy alias. | Set only if `USE_DOCKER_DEFAULT_SECCOMP=false`; the path must exist on the daemon host, not merely in this repository. |
 | `REDIS_URL` | `redis://redis:6379/0` | Redis URL for shared sessions, locks, and rate limits. | Use Redis in production and for multi-replica deployments. |
@@ -623,12 +628,18 @@ See `.env.example` for source defaults. `setup.sh` and `setup.ps1` create `.env`
 | `MAX_ACTIVE_SESSIONS` | `100` | Maximum active sessions tracked by the gateway. | Size to host capacity and Redis/state expectations. |
 | `MAX_CONTAINERS_PER_PRINCIPAL` | `3` | Maximum active sessions per authenticated subject and tenant. | Keep small for shared deployments. |
 | `CONTAINER_CREATE_GUARD_TIMEOUT` | `30` | Timeout in seconds while waiting for the serialized container creation guard. | Increase only if Docker is slow during normal operation. |
+| `SESSION_TIMEOUT_SECONDS` | `1200` | Idle timeout for sandbox sessions. | Keep short for public/shared deployments. |
+| `MAX_SESSION_LIFETIME_SECONDS` | `3600` | Hard lifetime for a sandbox session, regardless of activity. | Prevents users from keeping containers alive forever. Lower for public beta. |
+| `MAX_EXECUTIONS_PER_SESSION` | `100` | Maximum number of executions allowed in one session before it is removed. | Use this as a per-session abuse budget. Lower for public beta. |
 
 ### Sandbox Runtime
 
 | Variable | Default | Description | Best practices |
 | --- | --- | --- | --- |
 | `SANDBOX_IMAGE` | `code-sandbox:latest` | Docker image used for sandbox sessions. | Use immutable image tags or digests in production. |
+| `SANDBOX_RUNTIME` | empty | Optional Docker runtime for sandbox containers, for example `runsc` for gVisor or `kata-runtime` for Kata Containers. | Required in public beta mode. Configure the runtime on the Docker daemon host first. |
+| `STRONG_SANDBOX_RUNTIMES` | `runsc,kata,kata-runtime,io.containerd.runsc.v1,io.containerd.kata.v2` | Comma-separated runtime names that satisfy strong isolation checks. | Keep narrow and aligned with runtimes actually installed on workers. |
+| `REQUIRE_STRONG_SANDBOX_ISOLATION` | public-beta-aware, `.env.example`: `false` | Requires `SANDBOX_RUNTIME` to match `STRONG_SANDBOX_RUNTIMES`. | Set `true` for any deployment that accepts arbitrary untrusted users. |
 | `SANDBOX_USER` | `sandbox` | User name recorded for sandbox behavior and defaults. | Keep aligned with the sandbox image. |
 | `SANDBOX_UID` | `10001` | Sandbox Linux user ID. | Keep non-root. |
 | `SANDBOX_GID` | `10001` | Sandbox Linux group ID. | Keep non-root. |
@@ -765,10 +776,11 @@ Recommended production deployment pattern:
 2. Run the gateway behind TLS infrastructure.
 3. Run Redis as a managed or persistent service.
 4. Run sandbox containers on dedicated worker hosts or a dedicated remote Docker daemon.
-5. Keep Docker daemon credentials and API keys out of source control.
-6. Monitor request rates, execution latency, error rates, `429` responses, active executions, active sessions, Redis health, Docker daemon health, container restarts, memory, CPU, and disk pressure.
-7. Rotate API keys and JWT secrets on a schedule.
-8. Keep base images, Python dependencies, Docker, and host kernels patched.
+5. For public beta, configure gVisor/runsc, Kata Containers, or an equivalent stronger runtime and set `PUBLIC_BETA_MODE=true`.
+6. Keep Docker daemon credentials and API keys out of source control.
+7. Monitor request rates, execution latency, error rates, `429` responses, active executions, active sessions, session expirations, Redis health, Docker daemon health, container restarts, memory, CPU, and disk pressure.
+8. Rotate API keys and JWT secrets on a schedule.
+9. Keep base images, Python dependencies, Docker, runtimes, and host kernels patched.
 
 Development notes:
 

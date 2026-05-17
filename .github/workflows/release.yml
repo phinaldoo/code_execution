@@ -58,8 +58,8 @@ jobs:
       - name: Validate bumped files
         run: |
           docker compose config -q
-          python -m compileall -q gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py .github/scripts
-          python -m unittest -q tests/test_gateway_unit.py
+          python -m compileall -q gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py tests/test_executor_unit.py .github/scripts
+          python -m unittest -q tests/test_gateway_unit.py tests/test_executor_unit.py
           bandit -q -r gateway sandbox
           pip-audit -r gateway/requirements.txt
           pip-audit -r sandbox/requirements.txt

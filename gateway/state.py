@@ -23,6 +23,8 @@ class SessionInfo:
     owner_tenant: Optional[str]
     docker_daemon_id: Optional[str] = None
     inject_sandbox_env: bool = False
+    expires_at: Optional[float] = None
+    execution_count: int = 0
 
 
 class StateBackend:
@@ -270,7 +272,7 @@ return 1
         session_timeout_seconds: int,
     ) -> None:
         """Save session to Redis with TTL."""
-        ttl = session_timeout_seconds + SESSION_TTL_GRACE_SECONDS
+        ttl = self._session_ttl(session, session_timeout_seconds)
         pipeline = self.client.pipeline()
         pipeline.hset(self._session_key(container_id), mapping=self._session_to_mapping(session))
         pipeline.expire(self._session_key(container_id), ttl)
@@ -289,7 +291,7 @@ return 1
             return None
 
         session.last_activity = time.time()
-        ttl = session_timeout_seconds + SESSION_TTL_GRACE_SECONDS
+        ttl = self._session_ttl(session, session_timeout_seconds)
         pipeline = self.client.pipeline()
         pipeline.hset(self._session_key(container_id), mapping=self._session_to_mapping(session))
         pipeline.expire(self._session_key(container_id), ttl)
@@ -402,6 +404,8 @@ return 1
             "owner_tenant": session.owner_tenant or "",
             "docker_daemon_id": session.docker_daemon_id or "",
             "inject_sandbox_env": "1" if session.inject_sandbox_env else "0",
+            "expires_at": str(session.expires_at or ""),
+            "execution_count": str(session.execution_count),
         }
 
     @staticmethod
@@ -415,7 +419,17 @@ return 1
             owner_tenant=mapping.get("owner_tenant") or None,
             docker_daemon_id=mapping.get("docker_daemon_id") or None,
             inject_sandbox_env=mapping.get("inject_sandbox_env", "0") == "1",
+            expires_at=float(mapping["expires_at"]) if mapping.get("expires_at") else None,
+            execution_count=int(mapping.get("execution_count") or 0),
         )
+
+    @staticmethod
+    def _session_ttl(session: SessionInfo, session_timeout_seconds: int) -> int:
+        idle_ttl = session_timeout_seconds + SESSION_TTL_GRACE_SECONDS
+        if session.expires_at is None:
+            return idle_ttl
+        lifetime_ttl = max(1, int(session.expires_at - time.time())) + SESSION_TTL_GRACE_SECONDS
+        return max(1, min(idle_ttl, lifetime_ttl))
 
     @staticmethod
     def _session_key(container_id: str) -> str:

@@ -1,9 +1,9 @@
 # ============================================================
 # Sandbox Container — Executes untrusted Python code securely
 # ============================================================
-# This image is used as an ephemeral container by the gateway.
-# Each code execution gets its own container instance that is
-# destroyed after completion.
+# This image is used for bounded sandbox sessions managed by the gateway.
+# A session can run multiple serialized executions and is destroyed after
+# idle timeout, hard lifetime, execution budget exhaustion, or client delete.
 #
 # Build: docker build -t code-sandbox -f Dockerfile .
 # ============================================================

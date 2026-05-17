@@ -253,6 +253,41 @@ class GatewaySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provision_mock.await_args.kwargs["target_dir"], "/home/sandbox")
         self.assertEqual(provision_mock.await_args.kwargs["files"][0].name, "input.txt")
 
+    async def test_run_code_in_sandbox_removes_session_after_execution_budget(self) -> None:
+        await self.state_backend.save_session(
+            "ctr-1",
+            SessionInfo(
+                created_at=1.0,
+                last_activity=1.0,
+                network_enabled=False,
+                owner_subject="subject-1",
+                owner_tenant=None,
+                docker_daemon_id="daemon-local",
+                execution_count=1,
+            ),
+            session_timeout_seconds=60,
+        )
+
+        fake_container = SimpleNamespace(id="ctr-1")
+        gateway_app.docker_client = SimpleNamespace(
+            containers=SimpleNamespace(get=mock.Mock(return_value=fake_container)),
+        )
+
+        with mock.patch.object(gateway_app, "MAX_EXECUTIONS_PER_SESSION", 1):
+            with mock.patch.object(gateway_app, "remove_container", mock.AsyncMock()) as remove_mock:
+                with self.assertRaises(HTTPException) as ctx:
+                    await gateway_app.run_code_in_sandbox(
+                        container_id="ctr-1",
+                        language="python",
+                        code="print('ok')",
+                        timeout=10,
+                        execution_id="exec-123",
+                    )
+
+        self.assertEqual(ctx.exception.status_code, 429)
+        remove_mock.assert_awaited_once()
+        self.assertEqual(remove_mock.await_args.kwargs["reason"], "max-executions")
+
     async def test_ensure_sandbox_env_file_provisions_via_exec(self) -> None:
         fake_container = SimpleNamespace(id="ctr-1")
 
@@ -280,16 +315,27 @@ class GatewayConfigurationTests(unittest.TestCase):
         overrides = {
             "DEFAULT_TIMEOUT": 30,
             "MAX_TIMEOUT": 120,
+            "DOCKER_CLIENT_TIMEOUT": 30,
+            "SESSION_TIMEOUT_SECONDS": 1200,
+            "MAX_SESSION_LIFETIME_SECONDS": 3600,
+            "MAX_EXECUTIONS_PER_SESSION": 100,
             "REQUIRE_AUTH": False,
             "JWT_SECRET": None,
             "STATIC_API_KEYS": [],
             "ENABLE_CORS": False,
             "ENABLE_DOCS": False,
             "IS_PRODUCTION": False,
+            "PUBLIC_BETA_MODE": False,
             "DOCKER_HOST": "",
+            "SANDBOX_IMAGE": "code-sandbox:1.1.0",
+            "SANDBOX_RUNTIME": "",
+            "STRONG_SANDBOX_RUNTIMES": ["runsc", "kata-runtime"],
+            "REQUIRE_STRONG_SANDBOX_ISOLATION": False,
             "USE_DOCKER_DEFAULT_SECCOMP": True,
             "SECCOMP_PROFILE_DAEMON_PATH": "",
             "SANDBOX_NETWORK_MODE": "bridge",
+            "ALLOW_PIP_INSTALLS": False,
+            "ALLOW_SANDBOX_ENV_INJECTION": False,
             "REQUIRE_SHARED_STATE": False,
             "MAX_CONTAINERS_PER_PRINCIPAL": 1,
             "MAX_ACTIVE_SESSIONS": 1,
@@ -345,6 +391,63 @@ class GatewayConfigurationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "ENABLE_DOCS"):
                 gateway_app.validate_runtime_configuration()
+
+    def test_validate_runtime_configuration_rejects_latest_image_in_production(self) -> None:
+        overrides = self._base_overrides(
+            REQUIRE_AUTH=True,
+            JWT_SECRET="secret",
+            IS_PRODUCTION=True,
+            DOCKER_HOST="tcp://remote-docker:2376",
+            REQUIRE_SHARED_STATE=True,
+            REDIS_URL="redis://redis:6379/0",
+            SANDBOX_IMAGE="code-sandbox:latest",
+        )
+
+        with ExitStack() as stack:
+            for name, value in overrides.items():
+                stack.enter_context(mock.patch.object(gateway_app, name, value))
+
+            with self.assertRaisesRegex(RuntimeError, "SANDBOX_IMAGE"):
+                gateway_app.validate_runtime_configuration()
+
+    def test_validate_runtime_configuration_requires_strong_runtime_for_public_beta(self) -> None:
+        overrides = self._base_overrides(
+            REQUIRE_AUTH=True,
+            JWT_SECRET="secret",
+            PUBLIC_BETA_MODE=True,
+            SANDBOX_NETWORK_MODE="none",
+            SANDBOX_IMAGE="code-sandbox:1.1.0",
+            SANDBOX_RUNTIME="",
+            DOCKER_HOST="tcp://remote-docker:2376",
+            REQUIRE_SHARED_STATE=True,
+            REDIS_URL="redis://redis:6379/0",
+        )
+
+        with ExitStack() as stack:
+            for name, value in overrides.items():
+                stack.enter_context(mock.patch.object(gateway_app, name, value))
+
+            with self.assertRaisesRegex(RuntimeError, "Public beta mode requires"):
+                gateway_app.validate_runtime_configuration()
+
+    def test_validate_runtime_configuration_accepts_public_beta_with_runsc(self) -> None:
+        overrides = self._base_overrides(
+            REQUIRE_AUTH=True,
+            JWT_SECRET="secret",
+            PUBLIC_BETA_MODE=True,
+            SANDBOX_NETWORK_MODE="none",
+            SANDBOX_IMAGE="code-sandbox:1.1.0",
+            SANDBOX_RUNTIME="runsc",
+            DOCKER_HOST="tcp://remote-docker:2376",
+            REQUIRE_SHARED_STATE=True,
+            REDIS_URL="redis://redis:6379/0",
+        )
+
+        with ExitStack() as stack:
+            for name, value in overrides.items():
+                stack.enter_context(mock.patch.object(gateway_app, name, value))
+
+            gateway_app.validate_runtime_configuration()
 
     def test_validate_runtime_configuration_requires_daemon_visible_seccomp_path(self) -> None:
         overrides = self._base_overrides(
