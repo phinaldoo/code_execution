@@ -793,3 +793,5 @@ Development notes:
 ## License
 
 This app is licensed under the Apache License 2.0. See `LICENSE`.
+
+Disclaimer: This software is provided "as is" without any warranties. Use at your own risk. The maintainers are not liable for damages resulting from use.
