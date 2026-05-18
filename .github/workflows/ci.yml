@@ -91,14 +91,14 @@ jobs:
           API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         run: python3 tests/test_execution.py
       - name: Scan gateway image
-        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: code-gateway:latest
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
       - name: Scan sandbox image
-        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # 0.28.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: code-sandbox:latest
           severity: HIGH,CRITICAL
