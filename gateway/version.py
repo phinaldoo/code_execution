@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -39,11 +40,15 @@ def load_app_version() -> tuple[str, str]:
 
 def get_version_payload() -> dict[str, Any]:
     version, tag = load_app_version()
+    app_env = os.getenv("APP_ENV", "").strip().lower()
+    public_beta = app_env in {"beta", "public_beta", "public-beta"} or os.getenv(
+        "PUBLIC_BETA_MODE", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     return {
         "version": version,
         "tag": tag,
         "api_contract_version": 1,
-        "beta": False,
+        "beta": public_beta,
         "active_execution_version": "v1",
         "default_execution_version": "v1",
         "supported_execution_versions": ["v1"],

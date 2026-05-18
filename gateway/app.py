@@ -54,8 +54,25 @@ def split_csv(value: Optional[str]) -> list[str]:
 
 APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
 IS_PRODUCTION = APP_ENV in {"prod", "production"}
+PUBLIC_BETA_MODE = str_to_bool(
+    os.getenv("PUBLIC_BETA_MODE"),
+    default=APP_ENV in {"beta", "public_beta", "public-beta"},
+)
 
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "code-sandbox:latest")
+SANDBOX_RUNTIME = os.getenv("SANDBOX_RUNTIME", "").strip()
+STRONG_SANDBOX_RUNTIMES = split_csv(os.getenv("STRONG_SANDBOX_RUNTIMES")) or [
+    "runsc",
+    "kata",
+    "kata-runtime",
+    "io.containerd.runsc.v1",
+    "io.containerd.kata.v2",
+]
+REQUIRE_STRONG_SANDBOX_ISOLATION = str_to_bool(
+    os.getenv("REQUIRE_STRONG_SANDBOX_ISOLATION"),
+    default=PUBLIC_BETA_MODE,
+)
+DOCKER_CLIENT_TIMEOUT = int(os.getenv("DOCKER_CLIENT_TIMEOUT", "30"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_EXECUTIONS", "10"))
 DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "30"))
 MAX_TIMEOUT = int(os.getenv("MAX_TIMEOUT", "120"))
@@ -218,7 +235,9 @@ docker_client: docker.DockerClient
 state_backend: StateBackend
 local_docker_daemon_id: Optional[str] = None
 local_docker_daemon_name: Optional[str] = None
-SESSION_TIMEOUT_SECONDS = 20 * 60
+SESSION_TIMEOUT_SECONDS = int(os.getenv("SESSION_TIMEOUT_SECONDS", str(20 * 60)))
+MAX_SESSION_LIFETIME_SECONDS = int(os.getenv("MAX_SESSION_LIFETIME_SECONDS", str(60 * 60)))
+MAX_EXECUTIONS_PER_SESSION = int(os.getenv("MAX_EXECUTIONS_PER_SESSION", "100"))
 
 REQUEST_COUNTER = Counter(
     "gateway_http_requests_total",
@@ -273,6 +292,47 @@ def docker_host_hostname(docker_host: str) -> Optional[str]:
     return parsed.hostname.lower() if parsed.hostname else None
 
 
+def image_reference_is_immutable(image: str) -> bool:
+    """Return whether an image reference is pinned enough for production use."""
+    if "@sha256:" in image:
+        return True
+    last_component = image.rsplit("/", 1)[-1]
+    if ":" not in last_component:
+        return False
+    tag = last_component.rsplit(":", 1)[-1].strip().lower()
+    return bool(tag and tag != "latest")
+
+
+def strong_sandbox_runtime_configured() -> bool:
+    """Return whether the configured Docker runtime is a known stronger isolation runtime."""
+    if not SANDBOX_RUNTIME:
+        return False
+    return SANDBOX_RUNTIME in set(STRONG_SANDBOX_RUNTIMES)
+
+
+def parse_optional_float(
+    value: Optional[str],
+    default: Optional[float] = None,
+) -> Optional[float]:
+    """Parse a string float, returning a default for missing or invalid values."""
+    if not value:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_optional_int(value: Optional[str], default: int = 0) -> int:
+    """Parse a string integer, returning a default for missing or invalid values."""
+    if not value:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def principal_scope(auth: AuthContext) -> str:
     """Generate a scope string for rate limiting based on subject and tenant."""
     return f"{auth.subject}:{auth.tenant or '-'}"
@@ -283,8 +343,22 @@ def validate_runtime_configuration() -> None:
     if DEFAULT_TIMEOUT > MAX_TIMEOUT:
         raise RuntimeError("DEFAULT_TIMEOUT must be less than or equal to MAX_TIMEOUT")
 
+    if DOCKER_CLIENT_TIMEOUT < 1:
+        raise RuntimeError("DOCKER_CLIENT_TIMEOUT must be at least 1 second")
+
     if MAX_REQUEST_BODY_SIZE < 1:
         raise RuntimeError("MAX_REQUEST_BODY_SIZE must be at least 1 byte")
+
+    if SESSION_TIMEOUT_SECONDS < 1:
+        raise RuntimeError("SESSION_TIMEOUT_SECONDS must be at least 1 second")
+
+    if MAX_SESSION_LIFETIME_SECONDS < SESSION_TIMEOUT_SECONDS:
+        raise RuntimeError(
+            "MAX_SESSION_LIFETIME_SECONDS must be greater than or equal to SESSION_TIMEOUT_SECONDS"
+        )
+
+    if MAX_EXECUTIONS_PER_SESSION < 1:
+        raise RuntimeError("MAX_EXECUTIONS_PER_SESSION must be at least 1")
 
     if REQUIRE_AUTH and not (JWT_SECRET or STATIC_API_KEYS):
         raise RuntimeError(
@@ -312,6 +386,13 @@ def validate_runtime_configuration() -> None:
     if SANDBOX_NETWORK_MODE not in {"bridge", "none"}:
         raise RuntimeError("SANDBOX_NETWORK_MODE must be either 'bridge' or 'none'")
 
+    if REQUIRE_STRONG_SANDBOX_ISOLATION and not strong_sandbox_runtime_configured():
+        allowed = ", ".join(STRONG_SANDBOX_RUNTIMES)
+        raise RuntimeError(
+            "Strong sandbox isolation is required, but SANDBOX_RUNTIME is not configured "
+            f"with a recognized runtime. Set SANDBOX_RUNTIME to one of: {allowed}"
+        )
+
     if not USE_DOCKER_DEFAULT_SECCOMP:
         if not SECCOMP_PROFILE_DAEMON_PATH:
             raise RuntimeError(
@@ -327,25 +408,31 @@ def validate_runtime_configuration() -> None:
     if REQUIRE_SHARED_STATE and not REDIS_URL:
         raise RuntimeError("REDIS_URL must be configured when shared state is required.")
 
-    if IS_PRODUCTION:
+    if IS_PRODUCTION or PUBLIC_BETA_MODE:
+        mode_name = "production/public beta"
         if ENABLE_DOCS:
-            raise RuntimeError("ENABLE_DOCS must be false in production.")
+            raise RuntimeError(f"ENABLE_DOCS must be false in {mode_name}.")
+        if not image_reference_is_immutable(SANDBOX_IMAGE):
+            raise RuntimeError(
+                f"SANDBOX_IMAGE must use an immutable tag or digest in {mode_name}; "
+                "floating references such as ':latest' are not allowed."
+            )
         if not DOCKER_HOST:
-            raise RuntimeError("DOCKER_HOST must be configured explicitly in production.")
+            raise RuntimeError(f"DOCKER_HOST must be configured explicitly in {mode_name}.")
         if DOCKER_HOST.startswith("unix://"):
             raise RuntimeError(
-                "DOCKER_HOST must point at a restricted TCP proxy or remote daemon in production; "
+                f"DOCKER_HOST must point at a restricted TCP proxy or remote daemon in {mode_name}; "
                 "raw Unix socket access is not allowed."
             )
         parsed_docker = urlparse(DOCKER_HOST)
         if parsed_docker.scheme == "tcp" and parsed_docker.port == 2375:
             raise RuntimeError(
-                "Production DOCKER_HOST must use TLS (port 2376) or ssh://. "
+                "DOCKER_HOST must use TLS (port 2376) or ssh:// in production/public beta. "
                 "Plain TCP on port 2375 is unencrypted and unsafe."
             )
         if parsed_docker.scheme not in {"tcp", "ssh"}:
             raise RuntimeError(
-                "Production DOCKER_HOST must use tcp:// (with TLS) or ssh://."
+                "DOCKER_HOST must use tcp:// (with TLS) or ssh:// in production/public beta."
             )
         if docker_host_hostname(DOCKER_HOST) in {
             "docker-proxy",
@@ -355,8 +442,25 @@ def validate_runtime_configuration() -> None:
             "host.docker.internal",
         }:
             raise RuntimeError(
-                "Production gateways must use a dedicated remote Docker daemon. "
+                "Production/public beta gateways must use a dedicated remote Docker daemon. "
                 "Local Docker socket proxies and loopback targets are not allowed."
+            )
+
+    if PUBLIC_BETA_MODE:
+        if not REQUIRE_AUTH:
+            raise RuntimeError("REQUIRE_AUTH must be true in public beta mode.")
+        if SANDBOX_NETWORK_MODE != "none":
+            raise RuntimeError("SANDBOX_NETWORK_MODE must be 'none' in public beta mode.")
+        if ALLOW_PIP_INSTALLS:
+            raise RuntimeError("ALLOW_PIP_INSTALLS must be false in public beta mode.")
+        if ALLOW_SANDBOX_ENV_INJECTION:
+            raise RuntimeError("ALLOW_SANDBOX_ENV_INJECTION must be false in public beta mode.")
+        if not image_reference_is_immutable(SANDBOX_IMAGE):
+            raise RuntimeError("SANDBOX_IMAGE must be immutable in public beta mode.")
+        if not strong_sandbox_runtime_configured():
+            raise RuntimeError(
+                "Public beta mode requires a stronger Docker runtime such as gVisor/runsc or Kata. "
+                "Configure SANDBOX_RUNTIME and STRONG_SANDBOX_RUNTIMES."
             )
 
     if MAX_CONTAINERS_PER_PRINCIPAL < 1:
@@ -476,6 +580,18 @@ def session_is_local(session: SessionInfo) -> bool:
     return session.docker_daemon_id == local_docker_daemon_id
 
 
+def session_hard_expired(session: SessionInfo, *, now: Optional[float] = None) -> bool:
+    """Return whether a session has exceeded its hard lifetime."""
+    if session.expires_at is None:
+        return False
+    return (now or time.time()) >= session.expires_at
+
+
+def session_idle_expired(session: SessionInfo, *, now: Optional[float] = None) -> bool:
+    """Return whether a session has exceeded its idle timeout."""
+    return (now or time.time()) - session.last_activity > SESSION_TIMEOUT_SECONDS
+
+
 def enforce_session_daemon_affinity(session: SessionInfo) -> None:
     """Raise HTTPException if session belongs to a different Docker daemon."""
     if session_is_local(session):
@@ -508,6 +624,11 @@ def recover_session_info(container: docker.models.containers.Container) -> Sessi
         owner_tenant=labels.get("owner-tenant") or None,
         docker_daemon_id=labels.get("docker-daemon-id") or local_docker_daemon_id,
         inject_sandbox_env=(labels.get("inject-sandbox-env") or "0") == "1",
+        expires_at=parse_optional_float(
+            labels.get("expires-at"),
+            created_at + MAX_SESSION_LIFETIME_SECONDS,
+        ),
+        execution_count=parse_optional_int(labels.get("execution-count"), 0),
     )
 
 
@@ -517,6 +638,33 @@ async def touch_session(container_id: str) -> Optional[SessionInfo]:
         container_id,
         session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
     )
+
+
+async def recover_or_remove_managed_container(
+    container: docker.models.containers.Container,
+    *,
+    missing_state_reason: str,
+) -> Optional[SessionInfo]:
+    """Recover a managed container without resetting shared-state session budgets."""
+    existing = await state_backend.get_session(container.id)
+    if existing is None:
+        if REQUIRE_SHARED_STATE:
+            await remove_container(
+                container.id,
+                reason=missing_state_reason,
+                container=container,
+            )
+            return None
+        session = recover_session_info(container)
+    else:
+        session = existing
+
+    await state_backend.save_session(
+        container.id,
+        session,
+        session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+    )
+    return session
 
 
 async def ensure_session_access(container_id: str, auth: AuthContext) -> SessionInfo:
@@ -538,6 +686,17 @@ async def ensure_session_access(container_id: str, auth: AuthContext) -> Session
                 detail="Container session not found, or it was shut down due to inactivity.",
             )
 
+        if REQUIRE_SHARED_STATE:
+            await remove_container(
+                container_id,
+                reason="missing-shared-session-state",
+                container=container,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="Container session state is unavailable; the sandbox was removed.",
+            )
+
         session = recover_session_info(container)
         await state_backend.save_session(
             container_id,
@@ -552,6 +711,14 @@ async def ensure_session_access(container_id: str, auth: AuthContext) -> Session
         raise HTTPException(status_code=403, detail="Container session belongs to another tenant")
 
     enforce_session_daemon_affinity(session)
+
+    if session_hard_expired(session):
+        await remove_container(container_id, reason="max-session-lifetime")
+        raise HTTPException(
+            status_code=404,
+            detail="Container session expired after reaching its maximum lifetime.",
+        )
+
     return session
 
 
@@ -656,7 +823,8 @@ async def cleanup_idle_containers() -> None:
             idle_ids = [
                 cid
                 for cid, session in sessions.items()
-                if session_is_local(session) and now - session.last_activity > SESSION_TIMEOUT_SECONDS
+                if session_is_local(session)
+                and (session_idle_expired(session, now=now) or session_hard_expired(session, now=now))
             ]
 
             for cid in idle_ids:
@@ -671,12 +839,12 @@ async def cleanup_idle_containers() -> None:
                 tracked_ids = set(sessions)
                 for container in managed_containers:
                     if container.id not in tracked_ids and container.name.startswith("sandbox-"):
-                        recovered = recover_session_info(container)
-                        await state_backend.save_session(
-                            container.id,
-                            recovered,
-                            session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+                        recovered = await recover_or_remove_managed_container(
+                            container,
+                            missing_state_reason="untracked-shared-session-state",
                         )
+                        if recovered is None:
+                            continue
                         logger.info("Recovered untracked managed container %s during cleanup", container.id)
             except Exception as exc:
                 logger.error("Error cleaning up untracked containers: %s", exc)
@@ -693,7 +861,7 @@ async def lifespan(app: FastAPI):
     global docker_client, execution_semaphore, state_backend, local_docker_daemon_id, local_docker_daemon_name
 
     validate_runtime_configuration()
-    docker_client = docker.from_env()
+    docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
     execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     state_backend = RedisStateBackend(REDIS_URL) if REDIS_URL else InMemoryStateBackend()
     await state_backend.connect()
@@ -722,12 +890,12 @@ async def lifespan(app: FastAPI):
             filters={"label": "managed-by=code-execution-gateway"},
         )
         for container in managed_containers:
-            session = recover_session_info(container)
-            await state_backend.save_session(
-                container.id,
-                session,
-                session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+            session = await recover_or_remove_managed_container(
+                container,
+                missing_state_reason="missing-shared-session-state",
             )
+            if session is None:
+                continue
             logger.info(
                 "Recovered container %s for subject=%s tenant=%s network=%s daemon=%s",
                 container.id,
@@ -740,13 +908,18 @@ async def lifespan(app: FastAPI):
         logger.warning("Failed to recover existing containers: %s", exc)
 
     logger.info(
-        "Gateway started env=%s auth=%s max_concurrent=%s default_timeout=%ss network=%s read_only_rootfs=%s docker_default_seccomp=%s state_backend=%s docker_daemon_id=%s",
+        "Gateway started env=%s public_beta=%s auth=%s max_concurrent=%s default_timeout=%ss session_ttl=%ss max_session_lifetime=%ss max_executions_per_session=%s network=%s read_only_rootfs=%s runtime=%s docker_default_seccomp=%s state_backend=%s docker_daemon_id=%s",
         APP_ENV,
+        PUBLIC_BETA_MODE,
         auth_mode_summary(),
         MAX_CONCURRENT,
         DEFAULT_TIMEOUT,
+        SESSION_TIMEOUT_SECONDS,
+        MAX_SESSION_LIFETIME_SECONDS,
+        MAX_EXECUTIONS_PER_SESSION,
         SANDBOX_NETWORK_MODE,
         SANDBOX_READ_ONLY_ROOTFS,
+        SANDBOX_RUNTIME or "default",
         USE_DOCKER_DEFAULT_SECCOMP,
         type(state_backend).__name__,
         local_docker_daemon_id or "-",
@@ -989,6 +1162,9 @@ class ContainerResponse(BaseModel):
     status: str
     uptime_seconds: float
     last_activity: float
+    expires_at: Optional[float] = None
+    execution_count: int = 0
+    max_executions: int = MAX_EXECUTIONS_PER_SESSION
     docker_daemon_id: Optional[str] = None
 
 
@@ -1292,6 +1468,8 @@ async def create_container_session(
     execution_id = str(uuid.uuid4())[:12]
     network_mode = SANDBOX_NETWORK_MODE if enable_network else "none"
     network_enabled = network_mode != "none"
+    now = time.time()
+    expires_at = now + MAX_SESSION_LIFETIME_SECONDS
 
     security_opts = ["no-new-privileges:true"]
     if not USE_DOCKER_DEFAULT_SECCOMP:
@@ -1324,6 +1502,8 @@ async def create_container_session(
             "owner-tenant": auth.tenant or "",
             "docker-daemon-id": local_docker_daemon_id or "",
             "inject-sandbox-env": "1" if inject_sandbox_env else "0",
+            "expires-at": str(expires_at),
+            "execution-count": "0",
         },
         "name": f"sandbox-{execution_id}",
         "read_only": SANDBOX_READ_ONLY_ROOTFS,
@@ -1331,6 +1511,8 @@ async def create_container_session(
         "user": f"{SANDBOX_UID}:{SANDBOX_GID}",
         "working_dir": "/home/sandbox",
     }
+    if SANDBOX_RUNTIME:
+        container_config["runtime"] = SANDBOX_RUNTIME
 
     container = await asyncio.to_thread(
         docker_client.containers.run,
@@ -1352,7 +1534,6 @@ async def create_container_session(
         )
         raise
 
-    now = time.time()
     session = SessionInfo(
         created_at=now,
         last_activity=now,
@@ -1361,6 +1542,8 @@ async def create_container_session(
         owner_tenant=auth.tenant,
         docker_daemon_id=local_docker_daemon_id,
         inject_sandbox_env=inject_sandbox_env,
+        expires_at=expires_at,
+        execution_count=0,
     )
     try:
         await state_backend.save_session(
@@ -1432,6 +1615,38 @@ async def run_code_in_sandbox(
     except docker.errors.NotFound as exc:
         await state_backend.delete_session(container_id)
         raise HTTPException(status_code=404, detail="Container session not found.") from exc
+
+    if session_hard_expired(session):
+        await remove_container(
+            container_id,
+            execution_id=execution_id,
+            reason="max-session-lifetime",
+            container=container,
+        )
+        raise HTTPException(
+            status_code=404,
+            detail="Container session expired after reaching its maximum lifetime.",
+        )
+
+    if session.execution_count >= MAX_EXECUTIONS_PER_SESSION:
+        await remove_container(
+            container_id,
+            execution_id=execution_id,
+            reason="max-executions",
+            container=container,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Container session reached its maximum number of executions.",
+        )
+
+    session.execution_count += 1
+    session.last_activity = time.time()
+    await state_backend.save_session(
+        container_id,
+        session,
+        session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+    )
 
     await touch_session(container_id)
     try:
@@ -1580,6 +1795,8 @@ async def create_container(
             status="active",
             uptime_seconds=0.0,
             last_activity=session.last_activity,
+            expires_at=session.expires_at,
+            execution_count=session.execution_count,
             docker_daemon_id=session.docker_daemon_id,
         )
     except HTTPException:
@@ -1602,6 +1819,8 @@ async def get_container(container_id: str, auth: AuthContext = Depends(verify_au
             status="active",
             uptime_seconds=max(0.0, now - session.created_at),
             last_activity=session.last_activity,
+            expires_at=session.expires_at,
+            execution_count=session.execution_count,
             docker_daemon_id=session.docker_daemon_id,
         )
     except docker.errors.NotFound as exc:
@@ -1735,12 +1954,18 @@ async def build_health_payload() -> tuple[bool, dict]:
         "docker_daemon_name": local_docker_daemon_name,
         "sandbox_image_available": image_ok,
         "sandbox_image": SANDBOX_IMAGE,
+        "sandbox_runtime": SANDBOX_RUNTIME or "default",
+        "public_beta_mode": PUBLIC_BETA_MODE,
+        "strong_sandbox_isolation_required": REQUIRE_STRONG_SANDBOX_ISOLATION,
         "state_backend": type(state_backend).__name__,
         "state_backend_healthy": state_ok,
         "cors_enabled": ENABLE_CORS,
         "cors_origins_configured": CORS_ALLOW_ORIGINS,
         "max_concurrent_executions": MAX_CONCURRENT,
         "default_timeout": DEFAULT_TIMEOUT,
+        "session_timeout_seconds": SESSION_TIMEOUT_SECONDS,
+        "max_session_lifetime_seconds": MAX_SESSION_LIFETIME_SECONDS,
+        "max_executions_per_session": MAX_EXECUTIONS_PER_SESSION,
         "metrics": metrics,
     }
     return healthy, payload
