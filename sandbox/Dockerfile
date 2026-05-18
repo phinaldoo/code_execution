@@ -15,6 +15,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # --- System Setup ---
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         # Required for some scientific packages
         libgomp1 \
