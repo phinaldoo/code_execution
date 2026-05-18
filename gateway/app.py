@@ -640,6 +640,33 @@ async def touch_session(container_id: str) -> Optional[SessionInfo]:
     )
 
 
+async def recover_or_remove_managed_container(
+    container: docker.models.containers.Container,
+    *,
+    missing_state_reason: str,
+) -> Optional[SessionInfo]:
+    """Recover a managed container without resetting shared-state session budgets."""
+    existing = await state_backend.get_session(container.id)
+    if existing is None:
+        if REQUIRE_SHARED_STATE:
+            await remove_container(
+                container.id,
+                reason=missing_state_reason,
+                container=container,
+            )
+            return None
+        session = recover_session_info(container)
+    else:
+        session = existing
+
+    await state_backend.save_session(
+        container.id,
+        session,
+        session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+    )
+    return session
+
+
 async def ensure_session_access(container_id: str, auth: AuthContext) -> SessionInfo:
     """Ensure the authenticated user has access to the container session."""
     session = await state_backend.get_session(container_id)
@@ -657,6 +684,17 @@ async def ensure_session_access(container_id: str, auth: AuthContext) -> Session
             raise HTTPException(
                 status_code=404,
                 detail="Container session not found, or it was shut down due to inactivity.",
+            )
+
+        if REQUIRE_SHARED_STATE:
+            await remove_container(
+                container_id,
+                reason="missing-shared-session-state",
+                container=container,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="Container session state is unavailable; the sandbox was removed.",
             )
 
         session = recover_session_info(container)
@@ -801,12 +839,12 @@ async def cleanup_idle_containers() -> None:
                 tracked_ids = set(sessions)
                 for container in managed_containers:
                     if container.id not in tracked_ids and container.name.startswith("sandbox-"):
-                        recovered = recover_session_info(container)
-                        await state_backend.save_session(
-                            container.id,
-                            recovered,
-                            session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+                        recovered = await recover_or_remove_managed_container(
+                            container,
+                            missing_state_reason="untracked-shared-session-state",
                         )
+                        if recovered is None:
+                            continue
                         logger.info("Recovered untracked managed container %s during cleanup", container.id)
             except Exception as exc:
                 logger.error("Error cleaning up untracked containers: %s", exc)
@@ -852,12 +890,12 @@ async def lifespan(app: FastAPI):
             filters={"label": "managed-by=code-execution-gateway"},
         )
         for container in managed_containers:
-            session = recover_session_info(container)
-            await state_backend.save_session(
-                container.id,
-                session,
-                session_timeout_seconds=SESSION_TIMEOUT_SECONDS,
+            session = await recover_or_remove_managed_container(
+                container,
+                missing_state_reason="missing-shared-session-state",
             )
+            if session is None:
+                continue
             logger.info(
                 "Recovered container %s for subject=%s tenant=%s network=%s daemon=%s",
                 container.id,

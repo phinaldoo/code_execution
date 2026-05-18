@@ -102,6 +102,70 @@ class GatewaySafetyTests(unittest.IsolatedAsyncioTestCase):
         session = await self.state_backend.get_session("ctr-fail")
         self.assertIsNotNone(session, "Session state must be preserved when container removal fails")
 
+    async def test_recover_or_remove_managed_container_preserves_existing_budget_state(self) -> None:
+        await self.state_backend.save_session(
+            "ctr-1",
+            SessionInfo(
+                created_at=1.0,
+                last_activity=2.0,
+                network_enabled=False,
+                owner_subject="subject-1",
+                owner_tenant=None,
+                docker_daemon_id="daemon-local",
+                expires_at=100.0,
+                execution_count=7,
+            ),
+            session_timeout_seconds=60,
+        )
+        fake_container = SimpleNamespace(
+            id="ctr-1",
+            labels={
+                "managed-by": "code-execution-gateway",
+                "owner-subject": "subject-1",
+                "execution-count": "0",
+            },
+            attrs={
+                "Created": "2025-01-15T10:00:00Z",
+                "HostConfig": {"NetworkMode": "none"},
+            },
+        )
+
+        session = await gateway_app.recover_or_remove_managed_container(
+            fake_container,
+            missing_state_reason="unit-test-missing-state",
+        )
+
+        self.assertIsNotNone(session)
+        self.assertEqual(session.execution_count, 7)
+        self.assertEqual(session.expires_at, 100.0)
+        saved = await self.state_backend.get_session("ctr-1")
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.execution_count, 7)
+
+    async def test_ensure_session_access_removes_managed_container_when_shared_state_missing(self) -> None:
+        fake_container = SimpleNamespace(
+            id="ctr-missing-state",
+            labels={
+                "managed-by": "code-execution-gateway",
+                "owner-subject": "subject-1",
+            },
+        )
+        gateway_app.docker_client = SimpleNamespace(
+            containers=SimpleNamespace(get=mock.Mock(return_value=fake_container)),
+        )
+
+        with mock.patch.object(gateway_app, "REQUIRE_SHARED_STATE", True):
+            with mock.patch.object(gateway_app, "remove_container", mock.AsyncMock()) as remove_mock:
+                with self.assertRaises(HTTPException) as ctx:
+                    await gateway_app.ensure_session_access(
+                        "ctr-missing-state",
+                        gateway_app.AuthContext(subject="subject-1", tenant=None, auth_type="api_key"),
+                    )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        remove_mock.assert_awaited_once()
+        self.assertEqual(remove_mock.await_args.kwargs["reason"], "missing-shared-session-state")
+
     async def test_create_container_session_cleans_up_when_state_save_fails(self) -> None:
         fake_container = SimpleNamespace(id="ctr-save-fail")
         gateway_app.docker_client = SimpleNamespace(
