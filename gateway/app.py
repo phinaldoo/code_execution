@@ -115,6 +115,7 @@ JWT_ALGORITHMS = split_csv(os.getenv("JWT_ALGORITHMS")) or ["HS256"]
 JWT_ISSUER = os.getenv("JWT_ISSUER")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE")
 JWT_TENANT_CLAIM = os.getenv("JWT_TENANT_CLAIM", "tenant_id")
+MIN_PRODUCTION_SECRET_LENGTH = 32
 
 MAX_INPUT_FILES = int(os.getenv("MAX_INPUT_FILES", "10"))
 MAX_INPUT_FILE_SIZE = int(os.getenv("MAX_INPUT_FILE_SIZE", str(5 * 1024 * 1024)))
@@ -366,11 +367,29 @@ def validate_runtime_configuration() -> None:
         )
 
     if IS_PRODUCTION and STATIC_API_KEYS:
-        too_short = [key.key_id for key in STATIC_API_KEYS if len(key.secret) < 32]
+        too_short = [
+            key.key_id
+            for key in STATIC_API_KEYS
+            if len(key.secret) < MIN_PRODUCTION_SECRET_LENGTH
+        ]
         if too_short:
             raise RuntimeError(
-                "Static API keys must be at least 32 characters in production. "
+                "Static API keys must be at least "
+                f"{MIN_PRODUCTION_SECRET_LENGTH} characters in production. "
                 f"Invalid key ids: {', '.join(too_short)}"
+            )
+
+    if IS_PRODUCTION and JWT_SECRET:
+        hmac_algorithms = [
+            algorithm
+            for algorithm in JWT_ALGORITHMS
+            if algorithm.upper().startswith("HS")
+        ]
+        if hmac_algorithms and len(JWT_SECRET) < MIN_PRODUCTION_SECRET_LENGTH:
+            raise RuntimeError(
+                "JWT_SECRET must be at least "
+                f"{MIN_PRODUCTION_SECRET_LENGTH} characters in production when using "
+                f"HMAC JWT algorithms. Configured HMAC algorithms: {', '.join(hmac_algorithms)}"
             )
 
     if ENABLE_CORS:

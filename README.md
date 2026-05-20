@@ -574,7 +574,7 @@ See `.env.example` for source defaults. `setup.sh` and `setup.ps1` create `.env`
 | `METRICS_AUTH_REQUIRED` | production-aware, `.env.example`: `true` | Requires Bearer authentication for `/metrics`. | Keep `true` outside private local development. |
 | `API_KEYS` | empty until setup | Comma-separated static API keys. Values may be `key_id:secret` or just `secret`. | Let setup generate a local key. Use long random per-environment secrets and rotate by temporarily listing old and new keys. |
 | `API_KEY` | empty | Legacy single-key fallback used only when `API_KEYS` is empty. | Prefer `API_KEYS`. |
-| `JWT_SECRET` | empty | Enables JWT authentication when set. JWTs must include `exp` and `sub`. | Use a strong secret or key material managed by your identity infrastructure. |
+| `JWT_SECRET` | empty | Enables JWT authentication when set. JWTs must include `exp` and `sub`. | Use a strong secret or key material managed by your identity infrastructure. HMAC JWT secrets must be at least 32 characters in production. |
 | `JWT_ALGORITHMS` | `HS256` | Comma-separated JWT algorithms accepted by PyJWT. | Keep narrow. Do not accept algorithms you do not issue. |
 | `JWT_ISSUER` | empty | Optional required JWT issuer. | Set in production when using JWT auth. |
 | `JWT_AUDIENCE` | empty | Optional required JWT audience. | Set in production when using JWT auth. |

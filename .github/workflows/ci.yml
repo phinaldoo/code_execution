@@ -55,9 +55,9 @@ jobs:
       - name: Run Bandit
         run: bandit -q -r gateway sandbox -s B102,B108,B404,B603
       - name: Audit gateway dependencies
-        run: pip-audit -r gateway/requirements.txt
+        run: python .github/scripts/audit_requirements.py gateway/requirements.txt
       - name: Audit sandbox dependencies
-        run: pip-audit -r sandbox/requirements.txt
+        run: python .github/scripts/audit_requirements.py sandbox/requirements.txt
 
   integration:
     runs-on: ubuntu-latest

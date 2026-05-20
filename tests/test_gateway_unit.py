@@ -408,10 +408,44 @@ class GatewayConfigurationTests(unittest.TestCase):
         overrides.update(extra)
         return overrides
 
+    def test_validate_runtime_configuration_rejects_short_hmac_jwt_secret_in_production(self) -> None:
+        overrides = self._base_overrides(
+            REQUIRE_AUTH=True,
+            JWT_SECRET="short-secret",
+            IS_PRODUCTION=True,
+            DOCKER_HOST="tcp://remote-docker:2376",
+            REQUIRE_SHARED_STATE=True,
+            REDIS_URL="redis://redis:6379/0",
+        )
+
+        with ExitStack() as stack:
+            for name, value in overrides.items():
+                stack.enter_context(mock.patch.object(gateway_app, name, value))
+
+            with self.assertRaisesRegex(RuntimeError, "JWT_SECRET"):
+                gateway_app.validate_runtime_configuration()
+
+    def test_validate_runtime_configuration_allows_asymmetric_jwt_key_material_in_production(self) -> None:
+        overrides = self._base_overrides(
+            REQUIRE_AUTH=True,
+            JWT_SECRET="public-key",
+            JWT_ALGORITHMS=["RS256"],
+            IS_PRODUCTION=True,
+            DOCKER_HOST="tcp://remote-docker:2376",
+            REQUIRE_SHARED_STATE=True,
+            REDIS_URL="redis://redis:6379/0",
+        )
+
+        with ExitStack() as stack:
+            for name, value in overrides.items():
+                stack.enter_context(mock.patch.object(gateway_app, name, value))
+
+            gateway_app.validate_runtime_configuration()
+
     def test_validate_runtime_configuration_rejects_plain_tcp_in_production(self) -> None:
         overrides = self._base_overrides(
             REQUIRE_AUTH=True,
-            JWT_SECRET="secret",
+            JWT_SECRET="a" * 32,
             IS_PRODUCTION=True,
             DOCKER_HOST="tcp://remote-docker:2375",
         )
@@ -426,7 +460,7 @@ class GatewayConfigurationTests(unittest.TestCase):
     def test_validate_runtime_configuration_rejects_local_proxy_in_production(self) -> None:
         overrides = self._base_overrides(
             REQUIRE_AUTH=True,
-            JWT_SECRET="secret",
+            JWT_SECRET="a" * 32,
             IS_PRODUCTION=True,
             DOCKER_HOST="tcp://docker-proxy:2376",
         )
@@ -441,7 +475,7 @@ class GatewayConfigurationTests(unittest.TestCase):
     def test_validate_runtime_configuration_rejects_docs_in_production(self) -> None:
         overrides = self._base_overrides(
             REQUIRE_AUTH=True,
-            JWT_SECRET="secret",
+            JWT_SECRET="a" * 32,
             IS_PRODUCTION=True,
             ENABLE_DOCS=True,
             DOCKER_HOST="tcp://remote-docker:2376",
@@ -459,7 +493,7 @@ class GatewayConfigurationTests(unittest.TestCase):
     def test_validate_runtime_configuration_rejects_latest_image_in_production(self) -> None:
         overrides = self._base_overrides(
             REQUIRE_AUTH=True,
-            JWT_SECRET="secret",
+            JWT_SECRET="a" * 32,
             IS_PRODUCTION=True,
             DOCKER_HOST="tcp://remote-docker:2376",
             REQUIRE_SHARED_STATE=True,
@@ -477,7 +511,7 @@ class GatewayConfigurationTests(unittest.TestCase):
     def test_validate_runtime_configuration_requires_strong_runtime_for_public_beta(self) -> None:
         overrides = self._base_overrides(
             REQUIRE_AUTH=True,
-            JWT_SECRET="secret",
+            JWT_SECRET="a" * 32,
             PUBLIC_BETA_MODE=True,
             SANDBOX_NETWORK_MODE="none",
             SANDBOX_IMAGE="code-sandbox:1.1.0",
@@ -497,7 +531,7 @@ class GatewayConfigurationTests(unittest.TestCase):
     def test_validate_runtime_configuration_accepts_public_beta_with_runsc(self) -> None:
         overrides = self._base_overrides(
             REQUIRE_AUTH=True,
-            JWT_SECRET="secret",
+            JWT_SECRET="a" * 32,
             PUBLIC_BETA_MODE=True,
             SANDBOX_NETWORK_MODE="none",
             SANDBOX_IMAGE="code-sandbox:1.1.0",

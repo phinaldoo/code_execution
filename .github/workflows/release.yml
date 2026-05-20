@@ -61,8 +61,8 @@ jobs:
           python -m compileall -q gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py tests/test_executor_unit.py .github/scripts
           python -m unittest -q tests/test_gateway_unit.py tests/test_executor_unit.py
           bandit -q -r gateway sandbox -s B102,B108,B404,B603
-          pip-audit -r gateway/requirements.txt
-          pip-audit -r sandbox/requirements.txt
+          python .github/scripts/audit_requirements.py gateway/requirements.txt
+          python .github/scripts/audit_requirements.py sandbox/requirements.txt
           python - <<'PY'
           import json
           import pathlib
