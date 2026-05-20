@@ -2,6 +2,8 @@
 
 Code Execution Gateway is a sub-service of the ChatUI project. It runs untrusted Python and Bash code in isolated Docker sandbox sessions and returns stdout, stderr, structured errors, execution timing, and generated files as JSON.
 
+> **Disclaimer:** This software is provided "as is" without any warranties. Use at your own risk. The maintainers are not liable for damages resulting from use.
+
 The service is built for LLM and chat UI workflows where the main ChatUI backend should not execute model-generated code directly. Instead, ChatUI calls this external gateway, the gateway creates or reuses a sandbox container, and submitted code runs inside that sandbox.
 
 Technical details:
@@ -793,5 +795,3 @@ Development notes:
 ## License
 
 This app is licensed under the Apache License 2.0. See `LICENSE`.
-
-Disclaimer: This software is provided "as is" without any warranties. Use at your own risk. The maintainers are not liable for damages resulting from use.

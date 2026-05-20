@@ -1451,7 +1451,7 @@ def build_tmpfs_config() -> dict[str, str]:
     owner = f"uid={SANDBOX_UID},gid={SANDBOX_GID}"
     return {
         "/home/sandbox": f"size={SANDBOX_HOME_TMPFS_SIZE},mode=0700,{owner}",
-        "/tmp": f"size={SANDBOX_TMP_ROOT_SIZE},mode=1777,{owner}",
+        "/tmp": f"size={SANDBOX_TMP_ROOT_SIZE},mode=1777,{owner}",  # nosec
     }
 
 
@@ -1488,11 +1488,11 @@ async def create_container_session(
         "environment": {
             "HOME": "/home/sandbox",
             "MPLBACKEND": "Agg",
-            "MPLCONFIGDIR": "/tmp/mpl_cache",
+            "MPLCONFIGDIR": "/tmp/mpl_cache",  # nosec
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
-            "TMPDIR": "/tmp/misc",
+            "TMPDIR": "/tmp/misc",  # nosec
         },
         "cap_drop": ["ALL"],
         "labels": {

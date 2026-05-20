@@ -16,7 +16,7 @@ scikit-learn==1.5.2
 sympy==1.13.3
 
 # HTTP requests (internet access enabled)
-requests==2.33.0
+requests==2.34.2
 
 # Browser automation
 playwright==1.52.0

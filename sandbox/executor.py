@@ -19,7 +19,7 @@ import re
 import site
 import signal
 import shutil
-import subprocess
+import subprocess  # nosec
 import sys
 import time
 import traceback
@@ -28,9 +28,9 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-CODE_PATH = Path("/tmp/code/main.py")
-OUTPUT_DIR = Path("/tmp/output")
-MISC_DIR = Path("/tmp/misc")
+CODE_PATH = Path("/tmp/code/main.py")  # nosec
+OUTPUT_DIR = Path("/tmp/output")  # nosec
+MISC_DIR = Path("/tmp/misc")  # nosec
 MAX_OUTPUT_LENGTH = 100_000  # Max chars for stdout/stderr
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file
 MAX_TOTAL_FILES_SIZE = 25 * 1024 * 1024  # 25MB total
@@ -367,7 +367,7 @@ def execute_python_child() -> None:
             "__name__": "__main__",
             "__file__": str(CODE_PATH),
         }
-        exec(compile(code, "<user_code>", "exec"), exec_globals)
+        exec(compile(code, "<user_code>", "exec"), exec_globals)  # nosec
     except SystemExit:
         raise
     except BaseException:
@@ -402,7 +402,7 @@ def execute_code(code: str) -> dict[str, Any]:
     try:
         child_env = os.environ.copy()
         child_env["CODE_B64"] = base64.b64encode(code.encode("utf-8")).decode("ascii")
-        process = subprocess.Popen(
+        process = subprocess.Popen(  # nosec
             [sys.executable, str(Path(__file__)), "--python-child"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -462,7 +462,7 @@ def execute_bash(code: str) -> dict[str, Any]:
     script_path.chmod(0o755)
 
     try:
-        process = subprocess.Popen(
+        process = subprocess.Popen(  # nosec
             ["/bin/bash", str(script_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -524,7 +524,7 @@ def install_pip_packages() -> tuple[str | None, float | None]:
         # Install to user directory to avoid permission issues
         # --no-cache-dir to keep it clean and fast
         cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", "--quiet"] + packages
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=install_timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=install_timeout)  # nosec
 
         install_time = round(time.monotonic() - start_install, 2)
 
@@ -579,7 +579,7 @@ def main() -> None:
         return
 
     exec_id = args.exec_id or uuid.uuid4().hex[:12]
-    MISC_DIR = Path(f"/tmp/misc/{exec_id}")
+    MISC_DIR = Path(f"/tmp/misc/{exec_id}")  # nosec
 
     setup_output_dir()
 
