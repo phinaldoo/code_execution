@@ -21,6 +21,9 @@ RUN apt-get update && \
         libgomp1 \
         # Fonts for matplotlib
         fonts-dejavu-core \
+        # Node runtime for editable slide rendering
+        nodejs \
+        npm \
         # Reaps orphaned child processes for long-lived sandbox sessions
         tini \
     && rm -rf /var/lib/apt/lists/* \
@@ -34,8 +37,15 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt && \
 
 # --- Playwright Browser Runtime ---
 # Install Chromium + required system libraries at build time so sandbox
-# sessions can use Playwright without runtime downloads.
+# sessions and slide renders share one browser cache without runtime downloads.
 RUN python -m playwright install --with-deps chromium
+
+# --- Slide Renderer Node Dependencies ---
+# The Node renderer uses the same Playwright version and browser cache as the
+# Python runtime. Do not run `playwright install` here; the browser is already
+# installed above under PLAYWRIGHT_BROWSERS_PATH.
+COPY v2/package.json v2/package-lock.json /opt/code-execution/v2/
+RUN npm --prefix /opt/code-execution/v2 ci --omit=dev --ignore-scripts --no-audit --no-fund
 
 # --- Pre-compile matplotlib font cache ---
 RUN python -c "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; plt.figure(); plt.close()" 2>/dev/null || true
@@ -48,7 +58,11 @@ RUN groupadd -r -g 10001 sandbox && \
 
 # --- Executor Script ---
 COPY executor.py /usr/local/bin/executor.py
-RUN chmod +x /usr/local/bin/executor.py
+COPY render_presentation.py /usr/local/bin/render_presentation.py
+COPY slide_renderer /opt/code-execution/slide_renderer
+COPY v1 /opt/code-execution/v1
+COPY v2/index.js /opt/code-execution/v2/index.js
+RUN chmod +x /usr/local/bin/executor.py /usr/local/bin/render_presentation.py
 
 # --- Environment ---
 ENV MPLBACKEND=Agg \
@@ -56,6 +70,8 @@ ENV MPLBACKEND=Agg \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
+    PYTHONPATH=/opt/code-execution \
+    XDG_CACHE_HOME=/tmp/.cache \
     HOME=/home/sandbox
 
 # --- Runtime ---

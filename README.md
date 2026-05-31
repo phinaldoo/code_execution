@@ -1,6 +1,6 @@
 # Code Execution Gateway
 
-Code Execution Gateway is a sub-service of the ChatUI project. It runs untrusted Python and Bash code in isolated Docker sandbox sessions and returns stdout, stderr, structured errors, execution timing, and generated files as JSON.
+Code Execution Gateway is a sub-service of the ChatUI project. It runs untrusted Python and Bash code in isolated Docker sandbox sessions and renders HTML slide presentations to PPTX archives from the same sandbox image.
 
 > **Disclaimer:** This software is provided "as is" without any warranties. Use at your own risk. The maintainers are not liable for damages resulting from use.
 
@@ -9,7 +9,7 @@ The service is built for LLM and chat UI workflows where the main ChatUI backend
 Technical details:
 
 - **FastAPI gateway** for auth, request validation, rate limits, Docker orchestration, health, metrics, and version metadata.
-- **Docker sandbox image** for Python, Bash, Playwright Chromium, data analysis packages, plotting, document utilities, and output collection.
+- **Docker sandbox image** for Python, Bash, Playwright Chromium, data analysis packages, plotting, document utilities, output collection, and slide rendering.
 - **Redis state backend** for shared session state, distributed locks, and rate limits in multi-replica deployments.
 - **Restricted docker-socket-proxy** for local development access to Docker without mounting the raw socket into the gateway.
 
@@ -30,6 +30,8 @@ Do not expose this service to arbitrary hostile users unless you add stronger is
 - Auto-saves Matplotlib figures when Python code calls `plt.show()`.
 - Supports input files uploaded as base64 and output files written to `/tmp/output`.
 - Can run Playwright Chromium inside the sandbox image.
+- Renders HTML slide decks through `POST /api/render`, returning a ZIP with a PPTX and slide PNG previews.
+- Includes both the legacy screenshot-based renderer (`v1`) and the beta editable renderer (`v2`) ported from `slide_presentation_renderer#1`.
 - Supports optional per-request pip installs when explicitly enabled.
 - Supports optional sandbox `.env` injection for trusted workflows.
 - Enforces memory, CPU, PID, timeout, request size, file size, rate, and concurrency limits.
@@ -54,12 +56,19 @@ sandbox container session
 executor captures output and files
 ```
 
+For slide rendering, the gateway creates a short-lived sandbox container from
+the same image and executes `/usr/local/bin/render_presentation.py`. Both code
+execution and slide rendering use the one Playwright Chromium install at
+`/ms-playwright` in the sandbox image.
+
 Main components:
 
 - `gateway/app.py` - FastAPI app, auth, rate limits, Docker container lifecycle, execution orchestration, health, metrics, and version endpoint.
 - `gateway/version.json` - gateway release version used by `/version`, OpenAPI metadata, and version response headers.
 - `gateway/state.py` - in-memory and Redis state backends for sessions, locks, and rate limits.
 - `sandbox/executor.py` - code runner inside each sandbox container.
+- `sandbox/render_presentation.py` - render CLI used by gateway `/api/render` jobs.
+- `sandbox/slide_renderer/`, `sandbox/v1/`, and `sandbox/v2/` - merged slide renderer runtime, including the v2 editable renderer.
 - `docker-compose.yml` - local development stack with gateway, Redis, docker socket proxy, and sandbox image build target.
 - `setup.sh` and `setup.ps1` - cross-platform setup helpers that create or sync `.env` and generate a local API key.
 - `security/seccomp-profile.json` - optional fallback seccomp allowlist profile. The default runtime path uses Docker's default seccomp policy.
@@ -327,6 +336,22 @@ curl -sS http://localhost:8000/execute \
   }"
 ```
 
+Render a slide deck:
+
+```bash
+curl -sS http://localhost:8000/api/render \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -o presentation.zip \
+  -d '{
+    "html": "<section class=\"slide\" style=\"width:1920px;height:1080px\">Hello slides</section>"
+  }'
+```
+
+The response is a ZIP archive containing a `.pptx` file and PNG slide previews
+under `slides/`. Legacy renderer clients can also use `X-API-Key: $TOKEN` and
+`POST /api/v1/render`.
+
 Delete the session:
 
 ```bash
@@ -356,6 +381,7 @@ Invoke-RestMethod -Method Delete -Uri "http://localhost:8000/containers/$($Conta
 - `GET /` - service metadata.
 - `GET /version` - release and execution contract metadata.
 - `GET /health` and `GET /healthz` - lightweight health, unauthenticated.
+- `GET /livez` and `GET /readyz` - renderer-compatible health aliases.
 - `GET /health/details` and `GET /healthz/details` - detailed health, authenticated when `REQUIRE_AUTH=true`.
 - `GET /metrics` - Prometheus metrics, protected by `METRICS_AUTH_REQUIRED`.
 - `GET /metrics/json` - JSON debug counters, authenticated when `REQUIRE_AUTH=true`.
@@ -363,6 +389,7 @@ Invoke-RestMethod -Method Delete -Uri "http://localhost:8000/containers/$($Conta
 - `GET /containers/{container_id}` - inspect a sandbox session.
 - `DELETE /containers/{container_id}` - delete a sandbox session.
 - `POST /execute` - execute Python or Bash in a sandbox session.
+- `POST /api/render` and `POST /api/v1/render` - render HTML slides to a ZIP containing PPTX and PNG previews.
 
 ### Create Container Request
 
@@ -445,6 +472,42 @@ Returned file contents are base64 encoded:
 }
 ```
 
+### Render Request
+
+```json
+{
+  "html": "<section class=\"slide\">Hello</section>",
+  "input_files": [
+    {
+      "file_name": "logo.png",
+      "base64_content": "base64-encoded-file-content"
+    }
+  ]
+}
+```
+
+Notes:
+
+- Slides are selected with the `.slide` CSS selector.
+- `input_files` are written to an `assets/` directory next to the HTML file, so HTML can reference `assets/logo.png`.
+- `base64` is accepted as an alias for `base64_content` for compatibility with the v2 renderer PR.
+- Set `SLIDE_RENDERING_VERSION=v2` to use the editable beta renderer. The default remains `v1`.
+
+### Render Response
+
+`POST /api/render` returns binary `application/zip` content. The archive contains:
+
+- `presentation_<version>_<timestamp>.pptx`
+- `slides/slide_001.png`, `slides/slide_002.png`, and so on
+
+Render responses include:
+
+- `X-Rendering-Version`
+- `X-Renderer-Version`
+- `X-Renderer-Version-Tag`
+- `X-Slide-Count`
+- `X-Render-ID`
+
 ### Version Response
 
 `GET /version` returns:
@@ -459,11 +522,17 @@ Returned file contents are base64 encoded:
   "default_execution_version": "v1",
   "supported_execution_versions": ["v1"],
   "available_execution_versions": ["v1"],
+  "active_rendering_version": "v1",
+  "default_rendering_version": "v1",
+  "supported_rendering_versions": ["v1", "v2"],
+  "available_rendering_versions": ["v1", "v2"],
   "features": {
     "gateway_version_headers": true,
     "persistent_sessions": true,
     "input_files": true,
-    "pip_packages": true
+    "pip_packages": true,
+    "slide_rendering": true,
+    "slide_renderer_version_headers": true
   }
 }
 ```
@@ -493,7 +562,7 @@ Bash execution details:
 - Background child processes are terminated after each run.
 - Non-zero exit codes are returned as `BashExitError`.
 
-The sandbox image includes common packages for data analysis, visualization, browser automation, document handling, and file formats, including NumPy, pandas, SciPy, Matplotlib, seaborn, scikit-learn, SymPy, requests, Playwright, openpyxl, PyYAML, reportlab, and python-docx.
+The sandbox image includes common packages for data analysis, visualization, browser automation, document handling, presentation rendering, and file formats, including NumPy, pandas, SciPy, Matplotlib, seaborn, scikit-learn, SymPy, requests, Playwright, openpyxl, PyYAML, reportlab, python-pptx, python-docx, Node.js, and PptxGenJS.
 
 Sandbox containers use a read-only root filesystem by default. Writable state is limited to bounded tmpfs mounts, primarily `/home/sandbox` for per-session files and `/tmp` for execution scratch space, output collection, and library caches.
 
@@ -587,7 +656,7 @@ See `.env.example` for source defaults. `setup.sh` and `setup.ps1` create `.env`
 | `ENABLE_CORS` | `true` | Enables FastAPI CORS middleware when origins are configured. | Keep enabled when browser clients call the gateway directly. Disable behind a same-origin proxy if not needed. |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:3000` | Comma-separated allowed origins. | Use exact ChatUI origins in production. Do not combine `*` with credentials. |
 | `CORS_ALLOW_METHODS` | `GET,POST,DELETE,OPTIONS` | Comma-separated allowed CORS methods. | Keep minimal. |
-| `CORS_ALLOW_HEADERS` | `Authorization,Content-Type,X-Request-ID` | Comma-separated allowed CORS headers. | Add only headers your clients actually send. |
+| `CORS_ALLOW_HEADERS` | `Authorization,Content-Type,X-Request-ID,X-API-Key` | Comma-separated allowed CORS headers. | Add only headers your clients actually send. `X-API-Key` is included for renderer compatibility. |
 | `CORS_ALLOW_CREDENTIALS` | `true` | Allows credentialed browser requests. | Keep `true` only with explicit origins. |
 
 ### Docker, State, And Redis
@@ -654,6 +723,30 @@ See `.env.example` for source defaults. `setup.sh` and `setup.ps1` create `.env`
 | `SANDBOX_HOME_TMPFS_SIZE` | `256m` | Bounded tmpfs size for `/home/sandbox`. | This is per-session persistent scratch space. |
 | `SANDBOX_READ_ONLY_ROOTFS` | `true` | Runs sandbox containers with a read-only root filesystem. | Keep `true` for untrusted workloads. |
 | `SANDBOX_NETWORK_MODE` | `none` | Docker network mode for sandbox sessions. `none` disables network; `bridge` enables network. | Keep `none` for untrusted workloads. Enable `bridge` only when required. |
+
+### Slide Rendering
+
+| Variable | Default | Description | Best practices |
+| --- | --- | --- | --- |
+| `SLIDE_RENDERING_VERSION` | `v1` | Active slide renderer. `v1` produces screenshot-based PPTX output; `v2` uses the editable beta renderer. | Keep `v1` for conservative compatibility; use `v2` when editable PowerPoint output is preferred. |
+| `RENDER_TIMEOUT_SECONDS` | `180` | End-to-end timeout for one render job. | Size for deck complexity, but keep bounded because render containers are heavier than code execs. |
+| `RENDER_QUEUE_TIMEOUT_MS` | `500` | Time to wait for a render concurrency slot. | Keep low for interactive clients. |
+| `PAGE_LOAD_TIMEOUT_MS` | `30000` | Browser page load timeout inside the renderer. | Must be less than `RENDER_TIMEOUT_SECONDS * 1000`. |
+| `MAX_CONCURRENT_RENDERS` | `2` | Gateway-wide render concurrency. | Tune to host memory and CPU. |
+| `RENDER_RATE_LIMIT_REQUESTS_PER_WINDOW` | `10` | Per-principal render request limit per window. | Lower for public/shared deployments. |
+| `RENDER_RATE_LIMIT_WINDOW_SECONDS` | `60` | Render rate limit window size in seconds. | Default gives per-minute limits. |
+| `RENDER_MAX_REQUEST_BODY_BYTES` | `180000000` | Maximum body size for `/api/render`. | Keep large enough for HTML and assets, but smaller than upstream proxy limits. |
+| `RENDER_MAX_HTML_CHARS` | `2000000` | Maximum HTML characters per render request. | Keep bounded to avoid very large DOMs. |
+| `RENDER_MAX_INPUT_FILES` | `32` | Maximum asset files per render request. | Keep bounded; combine assets where practical. |
+| `RENDER_MAX_SLIDES` | `200` | Maximum rendered slide count. | Lower for interactive deployments. |
+| `RENDER_MAX_ASSET_BYTES` | `25000000` | Maximum decoded size of one render asset. | Tune for expected images. |
+| `RENDER_MAX_TOTAL_ASSET_BYTES` | `120000000` | Maximum decoded size of all render assets. | Keep below request body and tmpfs budgets. |
+| `RENDER_MAX_OUTPUT_BYTES` | `220000000` | Maximum ZIP archive size returned by the renderer. | Keep below gateway/proxy response limits. |
+| `RENDER_SANDBOX_MEM_LIMIT` | `2g` | Memory limit for short-lived render containers. | Rendering is browser-heavy; keep separate from normal code session limits. |
+| `RENDER_SANDBOX_CPU_QUOTA` | `200000` | CPU quota for render containers. Default is about two CPUs. | Tune to host capacity. |
+| `RENDER_SANDBOX_PIDS_LIMIT` | `512` | PID limit for render containers. | Keep bounded while allowing Chromium subprocesses. |
+| `RENDER_SANDBOX_TMP_ROOT_SIZE` | `1g` | `/tmp` tmpfs size for render containers. | Must fit browser scratch space, assets, PPTX output, and previews. |
+| `RENDER_SANDBOX_SHM_SIZE` | `512m` | Shared memory size for render containers. | Chromium usually benefits from more shared memory than code execution. |
 
 ### Optional Risky Features
 
@@ -738,6 +831,7 @@ export API_TOKEN="$(grep '^API_KEYS=' .env | cut -d= -f2- | cut -d: -f2-)"
 
 python3 tests/verify_vm_flow.py
 python3 tests/verify_playwright.py
+python3 tests/verify_slide_rendering.py
 python3 tests/test_execution.py
 python3 tests/verify_features.py
 ```
@@ -751,6 +845,7 @@ $env:API_TOKEN = ($env:API_TOKEN -split ':', 2)[1]
 
 python tests\verify_vm_flow.py
 python tests\verify_playwright.py
+python tests\verify_slide_rendering.py
 python tests\test_execution.py
 python tests\verify_features.py
 ```

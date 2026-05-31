@@ -32,7 +32,7 @@ jobs:
       - name: Install gateway test dependencies
         run: python -m pip install -r gateway/requirements.txt
       - name: Compile Python sources
-        run: python -m compileall gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py tests/test_executor_unit.py .github/scripts
+        run: python -m compileall gateway sandbox tests/verification_client.py tests/verify_vm_flow.py tests/verify_playwright.py tests/verify_slide_rendering.py tests/verify_features.py tests/test_execution.py tests/test_gateway_unit.py tests/test_executor_unit.py .github/scripts
       - name: Run unit tests
         run: python -m unittest -q tests/test_gateway_unit.py tests/test_executor_unit.py
       - name: Validate version metadata
@@ -64,6 +64,7 @@ jobs:
     needs: validate
     env:
       CONTAINER_RATE_LIMIT_REQUESTS_PER_WINDOW: "30"
+      SLIDE_RENDERING_VERSION: v2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Build images
@@ -88,6 +89,11 @@ jobs:
         env:
           API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         run: python3 tests/verify_playwright.py
+      - name: Smoke test slide rendering
+        env:
+          API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          EXPECTED_RENDERING_VERSION: v2
+        run: python3 tests/verify_slide_rendering.py
       - name: Run integration suite
         env:
           API_TOKEN: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

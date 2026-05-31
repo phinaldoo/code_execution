@@ -44,6 +44,19 @@ def get_version_payload() -> dict[str, Any]:
     public_beta = app_env in {"beta", "public_beta", "public-beta"} or os.getenv(
         "PUBLIC_BETA_MODE", ""
     ).strip().lower() in {"1", "true", "yes", "on"}
+    explicit_rendering_version = (
+        os.getenv("SLIDE_RENDERING_VERSION")
+        or os.getenv("RENDERING_VERSION")
+        or os.getenv("ACTIVE_RENDERING_VERSION")
+    )
+    if explicit_rendering_version:
+        active_rendering_version = explicit_rendering_version.strip().lower()
+    else:
+        active_rendering_version = (
+            "v2"
+            if os.getenv("BETA", "").strip().lower() in {"1", "true", "yes", "on"}
+            else "v1"
+        )
     return {
         "version": version,
         "tag": tag,
@@ -53,11 +66,17 @@ def get_version_payload() -> dict[str, Any]:
         "default_execution_version": "v1",
         "supported_execution_versions": ["v1"],
         "available_execution_versions": ["v1"],
+        "active_rendering_version": active_rendering_version,
+        "default_rendering_version": "v1",
+        "supported_rendering_versions": ["v1", "v2"],
+        "available_rendering_versions": ["v1", "v2"],
         "features": {
             "gateway_version_headers": True,
             "persistent_sessions": True,
             "input_files": True,
             "pip_packages": True,
+            "slide_rendering": True,
+            "slide_renderer_version_headers": True,
         },
     }
 

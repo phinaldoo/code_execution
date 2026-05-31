@@ -28,5 +28,9 @@ pyyaml==6.0.2
 # PDF generation
 reportlab==4.2.5
 
+# PowerPoint rendering
+pydantic==2.11.3
+python-pptx==1.0.2
+
 # Word document processing
 python-docx==1.1.2

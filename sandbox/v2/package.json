@@ -1,0 +1,14 @@
+{
+  "name": "code-execution-slide-renderer-v2",
+  "version": "1.0.0",
+  "description": "Editable HTML-to-PPTX renderer sharing the code execution Playwright runtime",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "convert": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "1.52.0",
+    "pptxgenjs": "3.12.0"
+  }
+}

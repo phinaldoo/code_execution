@@ -2,9 +2,11 @@
 import asyncio
 import json
 import sys
+import tarfile
 import time
 import unittest
 from contextlib import ExitStack
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -373,6 +375,56 @@ class GatewaySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provisioned[0].name, ".env")
         self.assertEqual(provisioned[0].content, b"SECRET=1\n")
 
+    async def test_render_endpoint_returns_archive_headers(self) -> None:
+        gateway_app.render_semaphore = asyncio.Semaphore(1)
+        payload = gateway_app.RenderRequest(html="<section class='slide'>Hello</section>")
+        auth = gateway_app.AuthContext(subject="subject-1", tenant=None, auth_type="api_key")
+        fake_result = gateway_app.RenderSandboxResult(
+            render_id="render-123",
+            file_name="presentation_v2_test.zip",
+            rendering_version="v2",
+            content=b"zip-bytes",
+            media_type="application/zip",
+            slide_count=2,
+            execution_time=0.5,
+        )
+
+        with mock.patch.object(gateway_app, "enforce_rate_limit", mock.AsyncMock()):
+            with mock.patch.object(
+                gateway_app,
+                "render_presentation_in_sandbox",
+                mock.AsyncMock(return_value=fake_result),
+            ) as render_mock:
+                response = await gateway_app.render_endpoint(payload, auth)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b"zip-bytes")
+        self.assertEqual(response.media_type, "application/zip")
+        self.assertEqual(response.headers["x-rendering-version"], "v2")
+        self.assertEqual(response.headers["x-slide-count"], "2")
+        self.assertEqual(response.headers["x-render-id"], "render-123")
+        self.assertIn("presentation_v2_test.zip", response.headers["content-disposition"])
+        render_mock.assert_awaited_once()
+
+    async def test_create_render_container_uses_render_resource_limits(self) -> None:
+        auth = gateway_app.AuthContext(subject="subject-1", tenant=None, auth_type="api_key")
+
+        with mock.patch.object(gateway_app, "enforce_container_creation_limits", mock.AsyncMock()):
+            with mock.patch.object(
+                gateway_app,
+                "create_container_session",
+                mock.AsyncMock(return_value="ctr-render"),
+            ) as create_mock:
+                container_id = await gateway_app.create_render_container(auth)
+
+        self.assertEqual(container_id, "ctr-render")
+        create_mock.assert_awaited_once()
+        kwargs = create_mock.await_args.kwargs
+        self.assertEqual(kwargs["purpose"], "slide-render")
+        self.assertEqual(kwargs["name_prefix"], "render")
+        self.assertFalse(kwargs["enable_network"])
+        self.assertEqual(kwargs["mem_limit"], gateway_app.RENDER_SANDBOX_MEM_LIMIT)
+
 
 class GatewayConfigurationTests(unittest.TestCase):
     def _base_overrides(self, **extra):
@@ -581,6 +633,37 @@ class GatewayConfigurationTests(unittest.TestCase):
     def test_create_container_request_network_defaults_to_off(self) -> None:
         self.assertFalse(gateway_app.CreateContainerRequest().enable_network)
 
+    def test_render_request_accepts_base64_alias(self) -> None:
+        request = gateway_app.RenderRequest(
+            html="<section class='slide'>Hello</section>",
+            input_files=[{"file_name": "image.png", "base64": "aGVsbG8="}],
+        )
+
+        self.assertEqual(request.input_files[0].base64_content, "aGVsbG8=")
+
+    def test_render_request_rejects_duplicate_input_names(self) -> None:
+        with self.assertRaises(ValidationError):
+            gateway_app.RenderRequest(
+                html="<section class='slide'>Hello</section>",
+                input_files=[
+                    {"file_name": "image.png", "base64_content": "aGVsbG8="},
+                    {"file_name": "image.png", "base64_content": "aGVsbG8="},
+                ],
+            )
+
+    def test_validate_render_payload_limits_rejects_too_many_files(self) -> None:
+        payload = gateway_app.RenderRequest(
+            html="<section class='slide'>Hello</section>",
+            input_files=[{"file_name": "a.png", "base64_content": "aGVsbG8="}],
+        )
+
+        with mock.patch.object(gateway_app, "RENDER_MAX_INPUT_FILES", 0):
+            with self.assertRaises(HTTPException) as ctx:
+                gateway_app.validate_render_payload_limits(payload)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("too many input_files", ctx.exception.detail)
+
 
 class GatewayVersionTests(unittest.IsolatedAsyncioTestCase):
     async def test_root_returns_service_metadata(self) -> None:
@@ -593,6 +676,7 @@ class GatewayVersionTests(unittest.IsolatedAsyncioTestCase):
                 "message": "Code Execution Gateway",
                 "version": gateway_app.APP_VERSION_TAG,
                 "execute_endpoint": "/execute",
+                "render_endpoint": "/api/render",
                 "version_endpoint": "/version",
             },
         )
@@ -613,11 +697,17 @@ class GatewayVersionTests(unittest.IsolatedAsyncioTestCase):
                 "default_execution_version": "v1",
                 "supported_execution_versions": ["v1"],
                 "available_execution_versions": ["v1"],
+                "active_rendering_version": "v1",
+                "default_rendering_version": "v1",
+                "supported_rendering_versions": ["v1", "v2"],
+                "available_rendering_versions": ["v1", "v2"],
                 "features": {
                     "gateway_version_headers": True,
                     "persistent_sessions": True,
                     "input_files": True,
                     "pip_packages": True,
+                    "slide_rendering": True,
+                    "slide_renderer_version_headers": True,
                 },
             },
         )
@@ -649,6 +739,42 @@ class FilePreparationTests(unittest.TestCase):
         with self.assertRaises(gateway_app.ExecutorOutputError):
             gateway_app.parse_executor_result("")
 
+    def test_parse_render_result_reads_prefixed_payload(self) -> None:
+        result = gateway_app.parse_render_result(
+            'noise\n__RENDER_RESULT__:{"file_name":"deck.zip","error":null}'
+        )
+
+        self.assertEqual(result["file_name"], "deck.zip")
+
+    def test_read_single_file_from_container_archive(self) -> None:
+        tar_buffer = BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w") as archive:
+            content = b"zip-bytes"
+            info = tarfile.TarInfo(name="deck.zip")
+            info.size = len(content)
+            archive.addfile(info, BytesIO(content))
+
+        fake_container = SimpleNamespace(
+            get_archive=mock.Mock(
+                return_value=(
+                    [tar_buffer.getvalue()],
+                    {"size": len(content)},
+                )
+            )
+        )
+
+        content = gateway_app._read_single_file_from_container_archive(
+            fake_container,
+            path="/tmp/output/render-1/deck.zip",
+            max_bytes=100,
+        )
+
+        self.assertEqual(content, b"zip-bytes")
+
+    def test_normalize_render_output_path_rejects_traversal(self) -> None:
+        with self.assertRaises(RuntimeError):
+            gateway_app.normalize_render_output_path("/tmp/output/render-1/../../secret")
+
 
 class RequestLimitAndMetricsTests(unittest.IsolatedAsyncioTestCase):
     async def test_limited_receive_rejects_streaming_body_over_limit(self) -> None:
@@ -674,6 +800,16 @@ class RequestLimitAndMetricsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(gateway_app.request_content_length_exceeds_limit(large))
             self.assertFalse(gateway_app.request_content_length_exceeds_limit(invalid))
             self.assertFalse(gateway_app.request_content_length_exceeds_limit(missing))
+
+    def test_render_path_uses_render_body_limit(self) -> None:
+        self.assertEqual(
+            gateway_app.request_body_limit_for_path("/api/render"),
+            gateway_app.RENDER_MAX_REQUEST_BODY_SIZE,
+        )
+        self.assertEqual(
+            gateway_app.request_body_limit_for_path("/execute"),
+            gateway_app.MAX_REQUEST_BODY_SIZE,
+        )
 
     def test_metrics_path_label_uses_route_template(self) -> None:
         request = SimpleNamespace(

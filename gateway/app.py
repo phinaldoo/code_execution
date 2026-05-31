@@ -11,14 +11,17 @@ import binascii
 import json
 import logging
 import os
+import posixpath
 import re
 import secrets
 import socket
+import tarfile
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Optional
 from urllib.parse import urlparse
@@ -31,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from docker.utils.socket import frames_iter
 
 from state import InMemoryStateBackend, RedisStateBackend, SessionInfo, StateBackend
@@ -50,6 +53,32 @@ def split_csv(value: Optional[str]) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def int_from_env(names: str | tuple[str, ...], default: int, *, min_value: int = 1) -> int:
+    """Read an integer from the first configured env var name."""
+    env_names = (names,) if isinstance(names, str) else names
+    for name in env_names:
+        raw_value = os.getenv(name)
+        if raw_value is None:
+            continue
+        try:
+            return max(min_value, int(raw_value))
+        except ValueError:
+            return default
+    return default
+
+
+def resolve_slide_rendering_version() -> str:
+    """Resolve the active slide renderer version, preserving the old BETA switch."""
+    explicit = (
+        os.getenv("SLIDE_RENDERING_VERSION")
+        or os.getenv("RENDERING_VERSION")
+        or os.getenv("ACTIVE_RENDERING_VERSION")
+    )
+    if explicit:
+        return explicit.strip().lower()
+    return "v2" if str_to_bool(os.getenv("BETA"), default=False) else "v1"
 
 
 APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
@@ -101,7 +130,12 @@ ENABLE_DOCS = str_to_bool(os.getenv("ENABLE_DOCS", "false"))
 ENABLE_CORS = str_to_bool(os.getenv("ENABLE_CORS", "true"))
 CORS_ALLOW_ORIGINS = split_csv(os.getenv("CORS_ALLOW_ORIGINS"))
 CORS_ALLOW_METHODS = split_csv(os.getenv("CORS_ALLOW_METHODS")) or ["GET", "POST", "DELETE", "OPTIONS"]
-CORS_ALLOW_HEADERS = split_csv(os.getenv("CORS_ALLOW_HEADERS")) or ["Authorization", "Content-Type", "X-Request-ID"]
+CORS_ALLOW_HEADERS = split_csv(os.getenv("CORS_ALLOW_HEADERS")) or [
+    "Authorization",
+    "Content-Type",
+    "X-Request-ID",
+    "X-API-Key",
+]
 CORS_ALLOW_CREDENTIALS = str_to_bool(os.getenv("CORS_ALLOW_CREDENTIALS", "true"), default=True)
 
 REQUIRE_AUTH = str_to_bool(os.getenv("REQUIRE_AUTH"), default=IS_PRODUCTION)
@@ -129,6 +163,65 @@ PIP_PACKAGE_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*([\[,\]A-Za-z0-9._-]*)?"
     r"(([!=<>~]=?|>=?|<=?)[\w.*]+([,;]([!=<>~]=?|>=?|<=?)[\w.*]+)*)?$"
 )
+
+SLIDE_RENDERING_VERSION = resolve_slide_rendering_version()
+RENDER_RESULT_PREFIX = "__RENDER_RESULT__:"
+RENDER_TIMEOUT_SECONDS = int_from_env("RENDER_TIMEOUT_SECONDS", 180, min_value=5)
+RENDER_QUEUE_TIMEOUT_MS = int_from_env("RENDER_QUEUE_TIMEOUT_MS", 500, min_value=1)
+RENDER_MAX_CONCURRENT = int_from_env("MAX_CONCURRENT_RENDERS", 2, min_value=1)
+RENDER_MAX_REQUEST_BODY_SIZE = int_from_env(
+    ("RENDER_MAX_REQUEST_BODY_BYTES", "MAX_RENDER_REQUEST_BODY_BYTES"),
+    180_000_000,
+    min_value=1_024,
+)
+RENDER_MAX_HTML_CHARS = int_from_env(
+    ("RENDER_MAX_HTML_CHARS", "MAX_RENDER_HTML_CHARS", "MAX_HTML_CHARS"),
+    2_000_000,
+    min_value=1_000,
+)
+RENDER_MAX_INPUT_FILES = int_from_env(
+    ("RENDER_MAX_INPUT_FILES", "MAX_RENDER_INPUT_FILES"),
+    32,
+    min_value=1,
+)
+RENDER_MAX_SLIDES = int_from_env(
+    ("RENDER_MAX_SLIDES", "MAX_RENDER_SLIDES", "MAX_SLIDES"),
+    200,
+    min_value=1,
+)
+RENDER_MAX_ASSET_BYTES = int_from_env(
+    ("RENDER_MAX_ASSET_BYTES", "MAX_RENDER_ASSET_BYTES", "MAX_ASSET_BYTES"),
+    25_000_000,
+    min_value=1_024,
+)
+RENDER_MAX_TOTAL_ASSET_BYTES = int_from_env(
+    ("RENDER_MAX_TOTAL_ASSET_BYTES", "MAX_RENDER_TOTAL_ASSET_BYTES", "MAX_TOTAL_ASSET_BYTES"),
+    120_000_000,
+    min_value=1_024,
+)
+RENDER_MAX_OUTPUT_BYTES = int_from_env(
+    ("RENDER_MAX_OUTPUT_BYTES", "MAX_RENDER_OUTPUT_BYTES"),
+    220_000_000,
+    min_value=1_024,
+)
+RENDER_PAGE_LOAD_TIMEOUT_MS = int_from_env("PAGE_LOAD_TIMEOUT_MS", 30_000, min_value=1_000)
+RENDER_RATE_LIMIT_REQUESTS = int_from_env(
+    "RENDER_RATE_LIMIT_REQUESTS_PER_WINDOW",
+    10,
+    min_value=1,
+)
+RENDER_RATE_LIMIT_WINDOW_SECONDS = int_from_env(
+    "RENDER_RATE_LIMIT_WINDOW_SECONDS",
+    60,
+    min_value=1,
+)
+RENDER_SANDBOX_MEM_LIMIT = os.getenv("RENDER_SANDBOX_MEM_LIMIT", "2g")
+RENDER_SANDBOX_CPU_PERIOD = int_from_env("RENDER_SANDBOX_CPU_PERIOD", SANDBOX_CPU_PERIOD, min_value=1)
+RENDER_SANDBOX_CPU_QUOTA = int_from_env("RENDER_SANDBOX_CPU_QUOTA", SANDBOX_CPU_QUOTA, min_value=1)
+RENDER_SANDBOX_PIDS_LIMIT = int_from_env("RENDER_SANDBOX_PIDS_LIMIT", 512, min_value=1)
+RENDER_SANDBOX_TMP_ROOT_SIZE = os.getenv("RENDER_SANDBOX_TMP_ROOT_SIZE", "1g")
+RENDER_SANDBOX_SHM_SIZE = os.getenv("RENDER_SANDBOX_SHM_SIZE", "512m")
+RENDER_SANDBOX_HOME_TMPFS_SIZE = os.getenv("RENDER_SANDBOX_HOME_TMPFS_SIZE", SANDBOX_HOME_TMPFS_SIZE)
 
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS_PER_WINDOW", "30"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -176,6 +269,29 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as tar:
         with destination.open("wb") as output:
             shutil.copyfileobj(source, output)
         os.chmod(destination, member.mode or 0o600)
+"""
+FILE_READ_SCRIPT = r"""
+import os
+import shutil
+import sys
+from pathlib import Path
+
+path = Path(os.environ["READ_PATH"]).resolve()
+max_bytes = int(os.environ["MAX_BYTES"])
+
+if not str(path).startswith("/tmp/output/"):
+    print("requested file is outside /tmp/output", file=sys.stderr)
+    raise SystemExit(2)
+if not path.is_file():
+    print(f"file not found: {path}", file=sys.stderr)
+    raise SystemExit(1)
+size = path.stat().st_size
+if size > max_bytes:
+    print(f"file exceeds max size of {max_bytes} bytes", file=sys.stderr)
+    raise SystemExit(2)
+
+with path.open("rb") as source:
+    shutil.copyfileobj(source, sys.stdout.buffer)
 """
 
 
@@ -232,6 +348,7 @@ class RequestBodyTooLarge(ValueError):
 
 
 execution_semaphore: asyncio.Semaphore
+render_semaphore: asyncio.Semaphore
 docker_client: docker.DockerClient
 state_backend: StateBackend
 local_docker_daemon_id: Optional[str] = None
@@ -263,6 +380,19 @@ ACTIVE_EXECUTIONS_GAUGE = Gauge(
     "gateway_active_executions",
     "Current number of active code executions",
 )
+RENDER_COUNTER = Counter(
+    "gateway_slide_renders_total",
+    "Slide render attempts by outcome",
+    ["outcome"],
+)
+RENDER_LATENCY = Histogram(
+    "gateway_slide_render_duration_seconds",
+    "Slide render duration in seconds",
+)
+ACTIVE_RENDERS_GAUGE = Gauge(
+    "gateway_active_slide_renders",
+    "Current number of active slide renders",
+)
 
 metrics = {
     "total_executions": 0,
@@ -270,6 +400,11 @@ metrics = {
     "failed_executions": 0,
     "timed_out_executions": 0,
     "active_executions": 0,
+    "total_renders": 0,
+    "successful_renders": 0,
+    "failed_renders": 0,
+    "timed_out_renders": 0,
+    "active_renders": 0,
 }
 
 
@@ -349,6 +484,38 @@ def validate_runtime_configuration() -> None:
 
     if MAX_REQUEST_BODY_SIZE < 1:
         raise RuntimeError("MAX_REQUEST_BODY_SIZE must be at least 1 byte")
+
+    if SLIDE_RENDERING_VERSION not in {"v1", "v2"}:
+        raise RuntimeError("SLIDE_RENDERING_VERSION must be either 'v1' or 'v2'")
+
+    if RENDER_TIMEOUT_SECONDS < 5:
+        raise RuntimeError("RENDER_TIMEOUT_SECONDS must be at least 5 seconds")
+
+    if RENDER_PAGE_LOAD_TIMEOUT_MS > RENDER_TIMEOUT_SECONDS * 1000:
+        raise RuntimeError("PAGE_LOAD_TIMEOUT_MS must not exceed RENDER_TIMEOUT_SECONDS * 1000")
+
+    if RENDER_QUEUE_TIMEOUT_MS > RENDER_TIMEOUT_SECONDS * 1000:
+        raise RuntimeError("RENDER_QUEUE_TIMEOUT_MS must not exceed RENDER_TIMEOUT_SECONDS * 1000")
+
+    if RENDER_MAX_REQUEST_BODY_SIZE < RENDER_MAX_HTML_CHARS:
+        raise RuntimeError(
+            "RENDER_MAX_REQUEST_BODY_BYTES must be greater than or equal to RENDER_MAX_HTML_CHARS"
+        )
+
+    if RENDER_MAX_REQUEST_BODY_SIZE < RENDER_MAX_TOTAL_ASSET_BYTES:
+        raise RuntimeError(
+            "RENDER_MAX_REQUEST_BODY_BYTES must be greater than or equal to RENDER_MAX_TOTAL_ASSET_BYTES"
+        )
+
+    if RENDER_MAX_TOTAL_ASSET_BYTES < RENDER_MAX_ASSET_BYTES:
+        raise RuntimeError(
+            "RENDER_MAX_TOTAL_ASSET_BYTES must be greater than or equal to RENDER_MAX_ASSET_BYTES"
+        )
+
+    if RENDER_MAX_OUTPUT_BYTES < RENDER_MAX_ASSET_BYTES:
+        raise RuntimeError(
+            "RENDER_MAX_OUTPUT_BYTES must be greater than or equal to RENDER_MAX_ASSET_BYTES"
+        )
 
     if SESSION_TIMEOUT_SECONDS < 1:
         raise RuntimeError("SESSION_TIMEOUT_SECONDS must be at least 1 second")
@@ -569,6 +736,23 @@ def verify_auth(
 ) -> AuthContext:
     """FastAPI dependency to verify authentication credentials."""
     return authenticate_credentials(credentials, required=REQUIRE_AUTH)
+
+
+async def verify_render_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> AuthContext:
+    """Authenticate render requests with gateway Bearer auth or legacy X-API-Key."""
+    if not REQUIRE_AUTH:
+        return AuthContext(subject="anonymous", tenant=None, auth_type="none")
+
+    api_key = request.headers.get("X-API-Key")
+    if api_key:
+        static_context = decode_static_api_key(api_key.strip())
+        if static_context:
+            return static_context
+
+    return authenticate_credentials(credentials, required=True)
 
 
 def verify_metrics_auth(
@@ -857,7 +1041,7 @@ async def cleanup_idle_containers() -> None:
                 )
                 tracked_ids = set(sessions)
                 for container in managed_containers:
-                    if container.id not in tracked_ids and container.name.startswith("sandbox-"):
+                    if container.id not in tracked_ids and container.name.startswith(("sandbox-", "render-")):
                         recovered = await recover_or_remove_managed_container(
                             container,
                             missing_state_reason="untracked-shared-session-state",
@@ -877,11 +1061,12 @@ async def cleanup_idle_containers() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager for startup and shutdown."""
-    global docker_client, execution_semaphore, state_backend, local_docker_daemon_id, local_docker_daemon_name
+    global docker_client, execution_semaphore, render_semaphore, state_backend, local_docker_daemon_id, local_docker_daemon_name
 
     validate_runtime_configuration()
     docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT)
     execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    render_semaphore = asyncio.Semaphore(RENDER_MAX_CONCURRENT)
     state_backend = RedisStateBackend(REDIS_URL) if REDIS_URL else InMemoryStateBackend()
     await state_backend.connect()
 
@@ -927,11 +1112,13 @@ async def lifespan(app: FastAPI):
         logger.warning("Failed to recover existing containers: %s", exc)
 
     logger.info(
-        "Gateway started env=%s public_beta=%s auth=%s max_concurrent=%s default_timeout=%ss session_ttl=%ss max_session_lifetime=%ss max_executions_per_session=%s network=%s read_only_rootfs=%s runtime=%s docker_default_seccomp=%s state_backend=%s docker_daemon_id=%s",
+        "Gateway started env=%s public_beta=%s auth=%s max_concurrent=%s render_concurrent=%s render_version=%s default_timeout=%ss session_ttl=%ss max_session_lifetime=%ss max_executions_per_session=%s network=%s read_only_rootfs=%s runtime=%s docker_default_seccomp=%s state_backend=%s docker_daemon_id=%s",
         APP_ENV,
         PUBLIC_BETA_MODE,
         auth_mode_summary(),
         MAX_CONCURRENT,
+        RENDER_MAX_CONCURRENT,
+        SLIDE_RENDERING_VERSION,
         DEFAULT_TIMEOUT,
         SESSION_TIMEOUT_SECONDS,
         MAX_SESSION_LIFETIME_SECONDS,
@@ -985,13 +1172,20 @@ def metrics_path_label(request: Request) -> str:
     return "__unmatched__"
 
 
-def request_content_length_exceeds_limit(request: Request) -> bool:
+def request_body_limit_for_path(path: str) -> int:
+    """Return the request body limit for an incoming path."""
+    if path in {"/api/render", "/api/v1/render"}:
+        return RENDER_MAX_REQUEST_BODY_SIZE
+    return MAX_REQUEST_BODY_SIZE
+
+
+def request_content_length_exceeds_limit(request: Request, *, max_bytes: Optional[int] = None) -> bool:
     """Check Content-Length against the configured request body limit."""
     raw_content_length = request.headers.get("content-length")
     if not raw_content_length:
         return False
     try:
-        return int(raw_content_length) > MAX_REQUEST_BODY_SIZE
+        return int(raw_content_length) > (max_bytes or MAX_REQUEST_BODY_SIZE)
     except ValueError:
         return False
 
@@ -1024,8 +1218,9 @@ async def request_metrics_middleware(request: Request, call_next):
     request.state.request_id = request_id
     start = time.monotonic()
     limited_methods = {"POST", "PUT", "PATCH"}
+    max_body_bytes = request_body_limit_for_path(request.url.path)
 
-    if request.method in limited_methods and request_content_length_exceeds_limit(request):
+    if request.method in limited_methods and request_content_length_exceeds_limit(request, max_bytes=max_body_bytes):
         elapsed = time.monotonic() - start
         path_label = metrics_path_label(request)
         REQUEST_COUNTER.labels(request.method, path_label, "413").inc()
@@ -1033,7 +1228,7 @@ async def request_metrics_middleware(request: Request, call_next):
         return JSONResponse(
             status_code=413,
             content={
-                "detail": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE} bytes."
+                "detail": f"Request body too large. Maximum size is {max_body_bytes} bytes."
             },
             headers={"X-Request-ID": request_id},
         )
@@ -1041,7 +1236,7 @@ async def request_metrics_middleware(request: Request, call_next):
     if request.method in limited_methods:
         request._receive = limited_receive_factory(  # noqa: SLF001 - Starlette exposes no public receive setter.
             request.receive,
-            max_bytes=MAX_REQUEST_BODY_SIZE,
+            max_bytes=max_body_bytes,
         )
 
     try:
@@ -1061,7 +1256,7 @@ async def request_metrics_middleware(request: Request, call_next):
         return JSONResponse(
             status_code=413,
             content={
-                "detail": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE} bytes."
+                "detail": f"Request body too large. Maximum size is {max_body_bytes} bytes."
             },
             headers={"X-Request-ID": request_id},
         )
@@ -1207,6 +1402,75 @@ class ExecuteResponse(BaseModel):
     timed_out: bool = False
 
 
+_SAFE_RENDER_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+class RenderInputFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_name: str = Field(..., min_length=1, max_length=128)
+    base64_content: str = Field(
+        ...,
+        min_length=1,
+        max_length=35_000_000,
+        validation_alias=AliasChoices("base64_content", "base64"),
+    )
+
+    @field_validator("file_name")
+    @classmethod
+    def validate_file_name(cls, value: str) -> str:
+        if "/" in value or "\\" in value:
+            raise ValueError("file_name must not contain path separators")
+        if not _SAFE_RENDER_FILENAME_RE.fullmatch(value):
+            raise ValueError(
+                "file_name may only contain letters, numbers, dots, underscores and hyphens"
+            )
+        if value in {".", ".."}:
+            raise ValueError("invalid file_name")
+        return value
+
+
+class RenderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    html: str = Field(..., min_length=1)
+    input_files: list[RenderInputFile] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_input_files(self) -> "RenderRequest":
+        seen: set[str] = set()
+        for input_file in self.input_files:
+            if input_file.file_name in seen:
+                raise ValueError(f"duplicate input file name: {input_file.file_name}")
+            seen.add(input_file.file_name)
+        return self
+
+
+@dataclass(frozen=True)
+class RenderSandboxResult:
+    render_id: str
+    file_name: str
+    rendering_version: str
+    content: bytes
+    media_type: str
+    slide_count: int
+    execution_time: float
+
+
+def validate_render_payload_limits(payload: RenderRequest) -> None:
+    """Reject render requests that exceed gateway-known renderer limits."""
+    if len(payload.html) > RENDER_MAX_HTML_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"html is too large (>{RENDER_MAX_HTML_CHARS} characters)",
+        )
+    if len(payload.input_files) > RENDER_MAX_INPUT_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many input_files (max {RENDER_MAX_INPUT_FILES})",
+        )
+
+
 class CreateContainerRequest(BaseModel):
     enable_network: bool = False
     inject_sandbox_env: bool = False
@@ -1220,6 +1484,7 @@ async def root() -> JSONResponse:
             "message": "Code Execution Gateway",
             "version": APP_VERSION_TAG,
             "execute_endpoint": "/execute",
+            "render_endpoint": "/api/render",
             "version_endpoint": "/version",
         }
     )
@@ -1229,6 +1494,116 @@ async def root() -> JSONResponse:
 async def version() -> JSONResponse:
     """Application and execution contract version endpoint."""
     return JSONResponse(get_version_payload())
+
+
+@app.get("/livez")
+async def livez() -> JSONResponse:
+    """Renderer-compatible liveness check endpoint."""
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/internal/auth/apikey", include_in_schema=False)
+async def internal_api_key_auth(_: AuthContext = Depends(verify_render_auth)) -> Response:
+    """Renderer-compatible internal auth probe endpoint."""
+    return Response(status_code=204)
+
+
+@app.post("/api/render")
+@app.post("/api/v1/render")
+async def render_endpoint(
+    payload: RenderRequest,
+    auth: AuthContext = Depends(verify_render_auth),
+) -> Response:
+    """Render presentation HTML to a PPTX archive in the shared sandbox runtime."""
+    render_id = str(uuid.uuid4())[:12]
+    acquired_slot = False
+    metrics["total_renders"] += 1
+    metrics["active_renders"] += 1
+    ACTIVE_RENDERS_GAUGE.inc()
+    start = time.monotonic()
+
+    try:
+        validate_render_payload_limits(payload)
+        try:
+            await asyncio.wait_for(
+                render_semaphore.acquire(),
+                timeout=RENDER_QUEUE_TIMEOUT_MS / 1000,
+            )
+            acquired_slot = True
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="renderer is busy, please retry shortly",
+                headers={"Retry-After": "1"},
+            ) from exc
+
+        await enforce_rate_limit(
+            f"render:{principal_scope(auth)}",
+            limit=RENDER_RATE_LIMIT_REQUESTS,
+            window_seconds=RENDER_RATE_LIMIT_WINDOW_SECONDS,
+            message="Render rate limit exceeded for this principal.",
+        )
+        await enforce_rate_limit(
+            f"container-create:{principal_scope(auth)}",
+            limit=CONTAINER_RATE_LIMIT_REQUESTS,
+            window_seconds=CONTAINER_RATE_LIMIT_WINDOW_SECONDS,
+            message="Container creation rate limit exceeded for this principal.",
+        )
+
+        try:
+            result = await render_presentation_in_sandbox(
+                payload=payload,
+                auth=auth,
+                render_id=render_id,
+                timeout=RENDER_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Container creation is temporarily saturated. Please retry shortly.",
+            ) from exc
+
+        metrics["successful_renders"] += 1
+        RENDER_COUNTER.labels("successful").inc()
+        RENDER_LATENCY.observe(time.monotonic() - start)
+        logger.info(
+            "[%s] Render complete version=%s slides=%s bytes=%s time=%ss",
+            render_id,
+            result.rendering_version,
+            result.slide_count,
+            len(result.content),
+            result.execution_time,
+        )
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{result.file_name}"',
+            "X-Rendering-Version": result.rendering_version,
+            "X-Renderer-Version": APP_VERSION,
+            "X-Renderer-Version-Tag": APP_VERSION_TAG,
+            "X-Code-Execution-Version": APP_VERSION,
+            "X-Code-Execution-Version-Tag": APP_VERSION_TAG,
+            "X-Slide-Count": str(result.slide_count),
+            "X-Render-ID": result.render_id,
+        }
+        return Response(content=result.content, media_type=result.media_type, headers=headers)
+    except HTTPException as exc:
+        if exc.status_code == 504:
+            metrics["timed_out_renders"] += 1
+            RENDER_COUNTER.labels("timed_out").inc()
+        else:
+            metrics["failed_renders"] += 1
+            RENDER_COUNTER.labels("failed").inc()
+        raise
+    except Exception as exc:
+        metrics["failed_renders"] += 1
+        RENDER_COUNTER.labels("failed").inc()
+        logger.exception("[%s] Render failed", render_id)
+        raise HTTPException(status_code=500, detail="rendering failed") from exc
+    finally:
+        if acquired_slot:
+            render_semaphore.release()
+        metrics["active_renders"] = max(0, metrics["active_renders"] - 1)
+        ACTIVE_RENDERS_GAUGE.dec()
 
 
 def build_execution_error_response(
@@ -1277,6 +1652,35 @@ def parse_executor_result(raw_output: str) -> dict[str, Any]:
             continue
 
     raise ExecutorOutputError("No structured JSON payload found in executor output")
+
+
+def parse_prefixed_result(raw_output: str, *, prefix: str, empty_error: str) -> dict[str, Any]:
+    """Parse the last structured prefixed JSON payload from command output."""
+    lines = [line.strip() for line in raw_output.strip().splitlines() if line.strip()]
+    if not lines:
+        raise ExecutorOutputError(empty_error)
+
+    for line in reversed(lines):
+        if not line.startswith(prefix):
+            continue
+        payload = line[len(prefix) :].strip()
+        if not payload:
+            continue
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+    raise ExecutorOutputError("No structured JSON payload found in renderer output")
+
+
+def parse_render_result(raw_output: str) -> dict[str, Any]:
+    """Parse a structured render payload from Docker exec output."""
+    return parse_prefixed_result(
+        raw_output,
+        prefix=RENDER_RESULT_PREFIX,
+        empty_error="Renderer returned no output",
+    )
 
 
 def _read_env_source_bytes() -> Optional[bytes]:
@@ -1398,6 +1802,93 @@ async def provision_files_in_container(
         )
 
 
+def normalize_render_output_path(path: str) -> str:
+    """Validate and normalize a renderer output path."""
+    stat_path = posixpath.normpath(path)
+    if not stat_path.startswith("/tmp/output/"):
+        raise RuntimeError("Renderer output path is outside the sandbox output directory")
+    return stat_path
+
+
+def _read_single_file_from_container_archive(
+    container: docker.models.containers.Container,
+    *,
+    path: str,
+    max_bytes: int,
+) -> bytes:
+    """Read one regular file from Docker's get_archive stream."""
+    stat_path = normalize_render_output_path(path)
+
+    stream, stat = container.get_archive(stat_path)
+    reported_size = int((stat or {}).get("size") or 0)
+    if reported_size > max_bytes:
+        raise RuntimeError(f"Renderer output exceeds max size of {max_bytes} bytes")
+
+    tar_bytes = b"".join(stream)
+    with tarfile.open(fileobj=BytesIO(tar_bytes), mode="r:*") as archive:
+        regular_members = [member for member in archive.getmembers() if member.isfile()]
+        if len(regular_members) != 1:
+            raise RuntimeError("Renderer output archive did not contain exactly one file")
+        member = regular_members[0]
+        if member.size > max_bytes:
+            raise RuntimeError(f"Renderer output exceeds max size of {max_bytes} bytes")
+        extracted = archive.extractfile(member)
+        if extracted is None:
+            raise RuntimeError("Renderer output file could not be read")
+        content = extracted.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise RuntimeError(f"Renderer output exceeds max size of {max_bytes} bytes")
+        return content
+
+
+def _read_single_file_from_container_exec(
+    container: docker.models.containers.Container,
+    *,
+    path: str,
+    max_bytes: int,
+) -> bytes:
+    """Read one regular file through Docker exec stdout."""
+    stat_path = normalize_render_output_path(path)
+    exec_info = docker_client.api.exec_create(
+        container.id,
+        cmd=["python", "-c", FILE_READ_SCRIPT],
+        stdin=True,
+        stdout=True,
+        stderr=True,
+        environment={
+            "READ_PATH": stat_path,
+            "MAX_BYTES": str(max_bytes),
+        },
+        user=f"{SANDBOX_UID}:{SANDBOX_GID}",
+        workdir="/home/sandbox",
+    )
+    stdout, stderr, exit_code = _run_exec_with_stdin(
+        exec_id=exec_info["Id"],
+        input_bytes=b"",
+    )
+    if exit_code != 0:
+        details = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        suffix = f": {details}" if details else ""
+        raise RuntimeError(f"Renderer output file could not be read{suffix}")
+    if len(stdout) > max_bytes:
+        raise RuntimeError(f"Renderer output exceeds max size of {max_bytes} bytes")
+    return stdout
+
+
+async def read_render_output_file(
+    container: docker.models.containers.Container,
+    *,
+    path: str,
+) -> bytes:
+    """Read a rendered archive file out of a sandbox container."""
+    return await asyncio.to_thread(
+        _read_single_file_from_container_exec,
+        container,
+        path=path,
+        max_bytes=RENDER_MAX_OUTPUT_BYTES,
+    )
+
+
 def prepare_files(files: list[FileInput]) -> list[PreparedFile]:
     """Validate and decode base64-encoded file inputs, returning prepared files."""
     prepared: list[PreparedFile] = []
@@ -1465,12 +1956,16 @@ async def ensure_sandbox_env_file(
         raise RuntimeError(f"Failed to provision sandbox .env file: {exc}") from exc
 
 
-def build_tmpfs_config() -> dict[str, str]:
+def build_tmpfs_config(
+    *,
+    tmp_root_size: Optional[str] = None,
+    home_tmpfs_size: Optional[str] = None,
+) -> dict[str, str]:
     """Build tmpfs mount configuration for sandbox container."""
     owner = f"uid={SANDBOX_UID},gid={SANDBOX_GID}"
     return {
-        "/home/sandbox": f"size={SANDBOX_HOME_TMPFS_SIZE},mode=0700,{owner}",
-        "/tmp": f"size={SANDBOX_TMP_ROOT_SIZE},mode=1777,{owner}",  # nosec
+        "/home/sandbox": f"size={home_tmpfs_size or SANDBOX_HOME_TMPFS_SIZE},mode=0700,{owner}",
+        "/tmp": f"size={tmp_root_size or SANDBOX_TMP_ROOT_SIZE},mode=1777,{owner}",  # nosec
     }
 
 
@@ -1479,6 +1974,15 @@ async def create_container_session(
     enable_network: bool,
     auth: AuthContext,
     inject_sandbox_env: bool,
+    purpose: str = "execution",
+    name_prefix: str = "sandbox",
+    mem_limit: Optional[str] = None,
+    cpu_period: Optional[int] = None,
+    cpu_quota: Optional[int] = None,
+    pids_limit: Optional[int] = None,
+    tmp_root_size: Optional[str] = None,
+    shm_size: Optional[str] = None,
+    home_tmpfs_size: Optional[str] = None,
 ) -> str:
     """Create a new sandbox container session and return its ID."""
     if not local_docker_daemon_id:
@@ -1496,14 +2000,17 @@ async def create_container_session(
 
     container_config = {
         "image": SANDBOX_IMAGE,
-        "mem_limit": SANDBOX_MEM_LIMIT,
-        "memswap_limit": SANDBOX_MEM_LIMIT,
-        "cpu_period": SANDBOX_CPU_PERIOD,
-        "cpu_quota": SANDBOX_CPU_QUOTA,
-        "pids_limit": SANDBOX_PIDS_LIMIT,
-        "shm_size": SANDBOX_SHM_SIZE,
+        "mem_limit": mem_limit or SANDBOX_MEM_LIMIT,
+        "memswap_limit": mem_limit or SANDBOX_MEM_LIMIT,
+        "cpu_period": cpu_period or SANDBOX_CPU_PERIOD,
+        "cpu_quota": cpu_quota or SANDBOX_CPU_QUOTA,
+        "pids_limit": pids_limit or SANDBOX_PIDS_LIMIT,
+        "shm_size": shm_size or SANDBOX_SHM_SIZE,
         "network_mode": network_mode,
-        "tmpfs": build_tmpfs_config(),
+        "tmpfs": build_tmpfs_config(
+            tmp_root_size=tmp_root_size,
+            home_tmpfs_size=home_tmpfs_size,
+        ),
         "environment": {
             "HOME": "/home/sandbox",
             "MPLBACKEND": "Agg",
@@ -1512,10 +2019,12 @@ async def create_container_session(
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
             "TMPDIR": "/tmp/misc",  # nosec
+            "XDG_CACHE_HOME": "/tmp/.cache",  # nosec
         },
         "cap_drop": ["ALL"],
         "labels": {
             "managed-by": "code-execution-gateway",
+            "purpose": purpose,
             "execution-id": execution_id,
             "owner-subject": auth.subject,
             "owner-tenant": auth.tenant or "",
@@ -1524,7 +2033,7 @@ async def create_container_session(
             "expires-at": str(expires_at),
             "execution-count": "0",
         },
-        "name": f"sandbox-{execution_id}",
+        "name": f"{name_prefix}-{execution_id}",
         "read_only": SANDBOX_READ_ONLY_ROOTFS,
         "security_opt": security_opts,
         "user": f"{SANDBOX_UID}:{SANDBOX_GID}",
@@ -1768,6 +2277,151 @@ async def run_code_in_sandbox(
         )
 
 
+def build_render_exec_environment(timeout: int) -> dict[str, str]:
+    """Build environment variables for the sandbox render CLI."""
+    return {
+        "APP_ENV": APP_ENV,
+        "BETA": "1" if SLIDE_RENDERING_VERSION == "v2" else "0",
+        "SLIDE_RENDERING_VERSION": SLIDE_RENDERING_VERSION,
+        "RENDERING_VERSION": SLIDE_RENDERING_VERSION,
+        "RENDER_TIMEOUT_SECONDS": str(timeout),
+        "RENDER_QUEUE_TIMEOUT_MS": str(RENDER_QUEUE_TIMEOUT_MS),
+        "PAGE_LOAD_TIMEOUT_MS": str(RENDER_PAGE_LOAD_TIMEOUT_MS),
+        "MAX_CONCURRENT_RENDERS": "1",
+        "RENDER_MAX_REQUEST_BODY_BYTES": str(RENDER_MAX_REQUEST_BODY_SIZE),
+        "RENDER_MAX_HTML_CHARS": str(RENDER_MAX_HTML_CHARS),
+        "RENDER_MAX_INPUT_FILES": str(RENDER_MAX_INPUT_FILES),
+        "RENDER_MAX_SLIDES": str(RENDER_MAX_SLIDES),
+        "RENDER_MAX_ASSET_BYTES": str(RENDER_MAX_ASSET_BYTES),
+        "RENDER_MAX_TOTAL_ASSET_BYTES": str(RENDER_MAX_TOTAL_ASSET_BYTES),
+        "RENDER_MAX_OUTPUT_BYTES": str(RENDER_MAX_OUTPUT_BYTES),
+        "HOME": "/home/sandbox",
+        "MPLBACKEND": "Agg",
+        "MPLCONFIGDIR": "/tmp/mpl_cache",  # nosec
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+        "TMPDIR": "/tmp",  # nosec
+        "XDG_CACHE_HOME": "/tmp/.cache",  # nosec
+        "PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright",
+    }
+
+
+async def create_render_container(auth: AuthContext) -> str:
+    """Create a short-lived sandbox container for slide rendering."""
+    async with state_backend.container_creation_guard(
+        timeout_seconds=CONTAINER_CREATE_GUARD_TIMEOUT
+    ):
+        await enforce_container_creation_limits(auth)
+        return await create_container_session(
+            enable_network=False,
+            auth=auth,
+            inject_sandbox_env=False,
+            purpose="slide-render",
+            name_prefix="render",
+            mem_limit=RENDER_SANDBOX_MEM_LIMIT,
+            cpu_period=RENDER_SANDBOX_CPU_PERIOD,
+            cpu_quota=RENDER_SANDBOX_CPU_QUOTA,
+            pids_limit=RENDER_SANDBOX_PIDS_LIMIT,
+            tmp_root_size=RENDER_SANDBOX_TMP_ROOT_SIZE,
+            shm_size=RENDER_SANDBOX_SHM_SIZE,
+            home_tmpfs_size=RENDER_SANDBOX_HOME_TMPFS_SIZE,
+        )
+
+
+async def render_presentation_in_sandbox(
+    *,
+    payload: RenderRequest,
+    auth: AuthContext,
+    render_id: str,
+    timeout: int,
+) -> RenderSandboxResult:
+    """Render a presentation inside the shared Playwright sandbox image."""
+    container_id = await create_render_container(auth)
+    container: docker.models.containers.Container | None = None
+    try:
+        container = await asyncio.to_thread(docker_client.containers.get, container_id)
+        request_dir = f"/tmp/render/{render_id}"  # nosec
+        output_dir = f"/tmp/output/{render_id}"  # nosec
+        request_file_name = "request.json"
+        request_json = json.dumps(payload.model_dump(mode="json"), separators=(",", ":")).encode("utf-8")
+
+        await provision_files_in_container(
+            container,
+            target_dir=request_dir,
+            files=[PreparedFile(name=request_file_name, content=request_json)],
+        )
+
+        exec_info = await asyncio.to_thread(
+            docker_client.api.exec_create,
+            container.id,
+            cmd=[
+                "python",
+                "/usr/local/bin/render_presentation.py",
+                "--request",
+                f"{request_dir}/{request_file_name}",
+                "--output-dir",
+                output_dir,
+            ],
+            environment=build_render_exec_environment(timeout),
+            user=f"{SANDBOX_UID}:{SANDBOX_GID}",
+            workdir="/home/sandbox",
+        )
+
+        raw_output, exit_code, timed_out = await run_exec_with_timeout(
+            container=container,
+            container_id=container_id,
+            exec_id=exec_info["Id"],
+            timeout=timeout,
+            execution_id=render_id,
+        )
+
+        if timed_out:
+            raise HTTPException(
+                status_code=504,
+                detail=f"render timeout exceeded after {timeout} seconds",
+            )
+
+        try:
+            result_data = parse_render_result(raw_output)
+        except (ExecutorOutputError, TypeError, ValueError) as exc:
+            logger.error("[%s] Failed to parse renderer output: %s", render_id, exc)
+            logger.debug("[%s] Raw renderer output: %s", render_id, raw_output[:2000] if raw_output else "")
+            raise HTTPException(status_code=500, detail="rendering failed") from exc
+
+        if result_data.get("error"):
+            status_code = 400 if exit_code == 2 else 500
+            raise HTTPException(status_code=status_code, detail=str(result_data["error"]))
+
+        output_path = str(result_data.get("output_path") or "")
+        if not output_path:
+            raise HTTPException(status_code=500, detail="renderer did not report an output file")
+
+        content = await read_render_output_file(container, path=output_path)
+        file_name = str(result_data.get("file_name") or posixpath.basename(output_path))
+        media_type = str(result_data.get("media_type") or "application/zip")
+        rendering_version = str(result_data.get("rendering_version") or SLIDE_RENDERING_VERSION)
+        slide_count = int(result_data.get("slide_count") or 0)
+        execution_time = float(result_data.get("execution_time") or 0)
+
+        return RenderSandboxResult(
+            render_id=render_id,
+            file_name=file_name,
+            rendering_version=rendering_version,
+            content=content,
+            media_type=media_type,
+            slide_count=slide_count,
+            execution_time=execution_time,
+        )
+    finally:
+        await remove_container(
+            container_id,
+            execution_id=render_id,
+            reason="slide-render-complete",
+            container=container,
+        )
+
+
 @app.post("/containers", response_model=ContainerResponse)
 async def create_container(
     request: Optional[CreateContainerRequest] = None,
@@ -1981,6 +2635,9 @@ async def build_health_payload() -> tuple[bool, dict]:
         "cors_enabled": ENABLE_CORS,
         "cors_origins_configured": CORS_ALLOW_ORIGINS,
         "max_concurrent_executions": MAX_CONCURRENT,
+        "max_concurrent_renders": RENDER_MAX_CONCURRENT,
+        "active_rendering_version": SLIDE_RENDERING_VERSION,
+        "render_timeout_seconds": RENDER_TIMEOUT_SECONDS,
         "default_timeout": DEFAULT_TIMEOUT,
         "session_timeout_seconds": SESSION_TIMEOUT_SECONDS,
         "max_session_lifetime_seconds": MAX_SESSION_LIFETIME_SECONDS,
@@ -1992,6 +2649,7 @@ async def build_health_payload() -> tuple[bool, dict]:
 
 @app.get("/health")
 @app.get("/healthz")
+@app.get("/readyz")
 async def health_check():
     """Simple health check endpoint returning service status."""
     healthy, payload = await build_health_payload()
