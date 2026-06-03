@@ -807,6 +807,14 @@ class RequestLimitAndMetricsTests(unittest.IsolatedAsyncioTestCase):
             gateway_app.RENDER_MAX_REQUEST_BODY_SIZE,
         )
         self.assertEqual(
+            gateway_app.request_body_limit_for_path("/api/latex/render"),
+            gateway_app.LATEX_RENDER_MAX_REQUEST_BODY_SIZE,
+        )
+        self.assertEqual(
+            gateway_app.request_body_limit_for_path("/api/v1/latex/render"),
+            gateway_app.LATEX_RENDER_MAX_REQUEST_BODY_SIZE,
+        )
+        self.assertEqual(
             gateway_app.request_body_limit_for_path("/execute"),
             gateway_app.MAX_REQUEST_BODY_SIZE,
         )

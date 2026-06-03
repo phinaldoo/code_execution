@@ -166,7 +166,13 @@ PIP_PACKAGE_PATTERN = re.compile(
 
 SLIDE_RENDERING_VERSION = resolve_slide_rendering_version()
 RENDER_RESULT_PREFIX = "__RENDER_RESULT__:"
+LATEX_RENDER_RESULT_PREFIX = "__LATEX_RENDER_RESULT__:"
 RENDER_TIMEOUT_SECONDS = int_from_env("RENDER_TIMEOUT_SECONDS", 180, min_value=5)
+LATEX_RENDER_TIMEOUT_SECONDS = int_from_env(
+    ("LATEX_RENDER_TIMEOUT_SECONDS", "LATEX_TIMEOUT_SECONDS"),
+    120,
+    min_value=5,
+)
 RENDER_QUEUE_TIMEOUT_MS = int_from_env("RENDER_QUEUE_TIMEOUT_MS", 500, min_value=1)
 RENDER_MAX_CONCURRENT = int_from_env("MAX_CONCURRENT_RENDERS", 2, min_value=1)
 RENDER_MAX_REQUEST_BODY_SIZE = int_from_env(
@@ -202,6 +208,19 @@ RENDER_MAX_TOTAL_ASSET_BYTES = int_from_env(
 RENDER_MAX_OUTPUT_BYTES = int_from_env(
     ("RENDER_MAX_OUTPUT_BYTES", "MAX_RENDER_OUTPUT_BYTES"),
     220_000_000,
+    min_value=1_024,
+)
+LATEX_MAX_TEX_CHARS = int_from_env("LATEX_MAX_TEX_CHARS", 250_000, min_value=1_000)
+LATEX_MAX_INPUT_FILES = int_from_env("LATEX_MAX_INPUT_FILES", 20, min_value=1)
+LATEX_MAX_ASSET_BYTES = int_from_env("LATEX_MAX_ASSET_BYTES", 10_000_000, min_value=1_024)
+LATEX_MAX_TOTAL_ASSET_BYTES = int_from_env("LATEX_MAX_TOTAL_ASSET_BYTES", 25_000_000, min_value=1_024)
+LATEX_MAX_OUTPUT_BYTES = int_from_env("LATEX_MAX_OUTPUT_BYTES", 25_000_000, min_value=1_024)
+LATEX_RENDER_MAX_REQUEST_BODY_SIZE = int_from_env(
+    ("LATEX_RENDER_MAX_REQUEST_BODY_BYTES", "MAX_LATEX_RENDER_REQUEST_BODY_BYTES"),
+    max(
+        RENDER_MAX_REQUEST_BODY_SIZE,
+        ((LATEX_MAX_TOTAL_ASSET_BYTES + 2) // 3) * 4 + LATEX_MAX_TEX_CHARS + 1_000_000,
+    ),
     min_value=1_024,
 )
 RENDER_PAGE_LOAD_TIMEOUT_MS = int_from_env("PAGE_LOAD_TIMEOUT_MS", 30_000, min_value=1_000)
@@ -515,6 +534,19 @@ def validate_runtime_configuration() -> None:
     if RENDER_MAX_OUTPUT_BYTES < RENDER_MAX_ASSET_BYTES:
         raise RuntimeError(
             "RENDER_MAX_OUTPUT_BYTES must be greater than or equal to RENDER_MAX_ASSET_BYTES"
+        )
+
+    if LATEX_RENDER_TIMEOUT_SECONDS < 5:
+        raise RuntimeError("LATEX_RENDER_TIMEOUT_SECONDS must be at least 5 seconds")
+
+    if LATEX_MAX_TOTAL_ASSET_BYTES < LATEX_MAX_ASSET_BYTES:
+        raise RuntimeError(
+            "LATEX_MAX_TOTAL_ASSET_BYTES must be greater than or equal to LATEX_MAX_ASSET_BYTES"
+        )
+
+    if LATEX_MAX_OUTPUT_BYTES < LATEX_MAX_ASSET_BYTES:
+        raise RuntimeError(
+            "LATEX_MAX_OUTPUT_BYTES must be greater than or equal to LATEX_MAX_ASSET_BYTES"
         )
 
     if SESSION_TIMEOUT_SECONDS < 1:
@@ -1176,6 +1208,8 @@ def request_body_limit_for_path(path: str) -> int:
     """Return the request body limit for an incoming path."""
     if path in {"/api/render", "/api/v1/render"}:
         return RENDER_MAX_REQUEST_BODY_SIZE
+    if path in {"/api/latex/render", "/api/v1/latex/render"}:
+        return LATEX_RENDER_MAX_REQUEST_BODY_SIZE
     return MAX_REQUEST_BODY_SIZE
 
 
@@ -1430,6 +1464,32 @@ class RenderInputFile(BaseModel):
         return value
 
 
+class LatexInputFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_name: str = Field(..., min_length=1, max_length=180)
+    base64_content: str = Field(
+        ...,
+        min_length=1,
+        max_length=35_000_000,
+        validation_alias=AliasChoices("base64_content", "base64"),
+    )
+
+    @field_validator("file_name")
+    @classmethod
+    def validate_file_name(cls, value: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise ValueError("file_name cannot be empty")
+        if "/" in cleaned or "\\" in cleaned:
+            raise ValueError("file_name must be a same-directory asset name")
+        if cleaned in {".", ".."}:
+            raise ValueError("invalid file_name")
+        if any(ord(char) < 32 or ord(char) == 127 for char in cleaned):
+            raise ValueError("file_name must not contain control characters")
+        return cleaned
+
+
 class RenderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1438,6 +1498,31 @@ class RenderRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_input_files(self) -> "RenderRequest":
+        seen: set[str] = set()
+        for input_file in self.input_files:
+            if input_file.file_name in seen:
+                raise ValueError(f"duplicate input file name: {input_file.file_name}")
+            seen.add(input_file.file_name)
+        return self
+
+
+class LatexRenderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tex: str = Field(..., min_length=1, max_length=LATEX_MAX_TEX_CHARS)
+    job_name: str = Field(default="document", min_length=1, max_length=80)
+    input_files: list[LatexInputFile] = Field(default_factory=list)
+
+    @field_validator("job_name")
+    @classmethod
+    def validate_job_name(cls, value: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip("._-")
+        if not normalized:
+            raise ValueError("job_name cannot be empty")
+        return normalized[:64]
+
+    @model_validator(mode="after")
+    def validate_input_files(self) -> "LatexRenderRequest":
         seen: set[str] = set()
         for input_file in self.input_files:
             if input_file.file_name in seen:
@@ -1457,6 +1542,18 @@ class RenderSandboxResult:
     execution_time: float
 
 
+@dataclass(frozen=True)
+class LatexRenderSandboxResult:
+    render_id: str
+    file_name: str
+    content: bytes
+    media_type: str
+    pdf_file_name: str
+    compiler: str
+    log_excerpt: str
+    execution_time: float
+
+
 def validate_render_payload_limits(payload: RenderRequest) -> None:
     """Reject render requests that exceed gateway-known renderer limits."""
     if len(payload.html) > RENDER_MAX_HTML_CHARS:
@@ -1469,6 +1566,31 @@ def validate_render_payload_limits(payload: RenderRequest) -> None:
             status_code=400,
             detail=f"too many input_files (max {RENDER_MAX_INPUT_FILES})",
         )
+
+
+def validate_latex_payload_limits(payload: LatexRenderRequest) -> None:
+    """Reject LaTeX render requests that exceed gateway-known limits."""
+    if len(payload.tex) > LATEX_MAX_TEX_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"tex is too large (>{LATEX_MAX_TEX_CHARS} characters)",
+        )
+    if len(payload.input_files) > LATEX_MAX_INPUT_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many input_files (max {LATEX_MAX_INPUT_FILES})",
+        )
+    total_bytes = 0
+    for input_file in payload.input_files:
+        try:
+            content_bytes = base64.b64decode(input_file.base64_content, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"invalid base64 for {input_file.file_name}") from exc
+        if len(content_bytes) > LATEX_MAX_ASSET_BYTES:
+            raise HTTPException(status_code=400, detail=f"input file {input_file.file_name} is too large")
+        total_bytes += len(content_bytes)
+        if total_bytes > LATEX_MAX_TOTAL_ASSET_BYTES:
+            raise HTTPException(status_code=400, detail="input files exceed total size limit")
 
 
 class CreateContainerRequest(BaseModel):
@@ -1485,6 +1607,7 @@ async def root() -> JSONResponse:
             "version": APP_VERSION_TAG,
             "execute_endpoint": "/execute",
             "render_endpoint": "/api/render",
+            "latex_render_endpoint": "/api/latex/render",
             "version_endpoint": "/version",
         }
     )
@@ -1606,6 +1729,103 @@ async def render_endpoint(
         ACTIVE_RENDERS_GAUGE.dec()
 
 
+@app.post("/api/latex/render")
+@app.post("/api/v1/latex/render")
+async def latex_render_endpoint(
+    payload: LatexRenderRequest,
+    auth: AuthContext = Depends(verify_render_auth),
+) -> Response:
+    """Render LaTeX source to a PDF bundle in the shared sandbox runtime."""
+    render_id = str(uuid.uuid4())[:12]
+    acquired_slot = False
+    metrics["total_renders"] += 1
+    metrics["active_renders"] += 1
+    ACTIVE_RENDERS_GAUGE.inc()
+    start = time.monotonic()
+
+    try:
+        validate_latex_payload_limits(payload)
+        try:
+            await asyncio.wait_for(
+                render_semaphore.acquire(),
+                timeout=RENDER_QUEUE_TIMEOUT_MS / 1000,
+            )
+            acquired_slot = True
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail="renderer is busy, please retry shortly",
+                headers={"Retry-After": "1"},
+            ) from exc
+
+        await enforce_rate_limit(
+            f"latex-render:{principal_scope(auth)}",
+            limit=RENDER_RATE_LIMIT_REQUESTS,
+            window_seconds=RENDER_RATE_LIMIT_WINDOW_SECONDS,
+            message="LaTeX render rate limit exceeded for this principal.",
+        )
+        await enforce_rate_limit(
+            f"container-create:{principal_scope(auth)}",
+            limit=CONTAINER_RATE_LIMIT_REQUESTS,
+            window_seconds=CONTAINER_RATE_LIMIT_WINDOW_SECONDS,
+            message="Container creation rate limit exceeded for this principal.",
+        )
+
+        try:
+            result = await render_latex_in_sandbox(
+                payload=payload,
+                auth=auth,
+                render_id=render_id,
+                timeout=LATEX_RENDER_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Container creation is temporarily saturated. Please retry shortly.",
+            ) from exc
+
+        metrics["successful_renders"] += 1
+        RENDER_COUNTER.labels("successful").inc()
+        RENDER_LATENCY.observe(time.monotonic() - start)
+        logger.info(
+            "[%s] LaTeX render complete pdf=%s bytes=%s time=%ss",
+            render_id,
+            result.pdf_file_name,
+            len(result.content),
+            result.execution_time,
+        )
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{result.file_name}"',
+            "X-Renderer-Version": APP_VERSION,
+            "X-Renderer-Version-Tag": APP_VERSION_TAG,
+            "X-Code-Execution-Version": APP_VERSION,
+            "X-Code-Execution-Version-Tag": APP_VERSION_TAG,
+            "X-Render-ID": result.render_id,
+            "X-PDF-File-Name": result.pdf_file_name,
+            "X-LaTeX-Compiler": result.compiler,
+        }
+        return Response(content=result.content, media_type=result.media_type, headers=headers)
+    except HTTPException as exc:
+        if exc.status_code == 504:
+            metrics["timed_out_renders"] += 1
+            RENDER_COUNTER.labels("timed_out").inc()
+        else:
+            metrics["failed_renders"] += 1
+            RENDER_COUNTER.labels("failed").inc()
+        raise
+    except Exception as exc:
+        metrics["failed_renders"] += 1
+        RENDER_COUNTER.labels("failed").inc()
+        logger.exception("[%s] LaTeX render failed", render_id)
+        raise HTTPException(status_code=500, detail="latex rendering failed") from exc
+    finally:
+        if acquired_slot:
+            render_semaphore.release()
+        metrics["active_renders"] = max(0, metrics["active_renders"] - 1)
+        ACTIVE_RENDERS_GAUGE.dec()
+
+
 def build_execution_error_response(
     *,
     execution_id: str,
@@ -1680,6 +1900,15 @@ def parse_render_result(raw_output: str) -> dict[str, Any]:
         raw_output,
         prefix=RENDER_RESULT_PREFIX,
         empty_error="Renderer returned no output",
+    )
+
+
+def parse_latex_render_result(raw_output: str) -> dict[str, Any]:
+    """Parse a structured LaTeX render payload from Docker exec output."""
+    return parse_prefixed_result(
+        raw_output,
+        prefix=LATEX_RENDER_RESULT_PREFIX,
+        empty_error="LaTeX renderer returned no output",
     )
 
 
@@ -2307,6 +2536,24 @@ def build_render_exec_environment(timeout: int) -> dict[str, str]:
     }
 
 
+def build_latex_render_exec_environment(timeout: int) -> dict[str, str]:
+    """Build environment variables for the sandbox LaTeX render CLI."""
+    return {
+        "APP_ENV": APP_ENV,
+        "LATEX_RENDER_TIMEOUT_SECONDS": str(timeout),
+        "LATEX_MAX_TEX_CHARS": str(LATEX_MAX_TEX_CHARS),
+        "LATEX_MAX_INPUT_FILES": str(LATEX_MAX_INPUT_FILES),
+        "LATEX_MAX_ASSET_BYTES": str(LATEX_MAX_ASSET_BYTES),
+        "LATEX_MAX_TOTAL_ASSET_BYTES": str(LATEX_MAX_TOTAL_ASSET_BYTES),
+        "LATEX_MAX_OUTPUT_BYTES": str(LATEX_MAX_OUTPUT_BYTES),
+        "HOME": "/home/sandbox",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+        "TMPDIR": "/tmp",  # nosec
+    }
+
+
 async def create_render_container(auth: AuthContext) -> str:
     """Create a short-lived sandbox container for slide rendering."""
     async with state_backend.container_creation_guard(
@@ -2326,6 +2573,111 @@ async def create_render_container(auth: AuthContext) -> str:
             tmp_root_size=RENDER_SANDBOX_TMP_ROOT_SIZE,
             shm_size=RENDER_SANDBOX_SHM_SIZE,
             home_tmpfs_size=RENDER_SANDBOX_HOME_TMPFS_SIZE,
+        )
+
+
+async def render_latex_in_sandbox(
+    *,
+    payload: LatexRenderRequest,
+    auth: AuthContext,
+    render_id: str,
+    timeout: int,
+) -> LatexRenderSandboxResult:
+    """Render a LaTeX document inside the shared sandbox image."""
+    container_id = await create_render_container(auth)
+    container: docker.models.containers.Container | None = None
+    try:
+        container = await asyncio.to_thread(docker_client.containers.get, container_id)
+        request_dir = f"/tmp/latex/{render_id}"  # nosec
+        output_dir = f"/tmp/output/{render_id}"  # nosec
+        request_file_name = "request.json"
+        request_json = json.dumps(payload.model_dump(mode="json"), separators=(",", ":")).encode("utf-8")
+
+        await provision_files_in_container(
+            container,
+            target_dir=request_dir,
+            files=[PreparedFile(name=request_file_name, content=request_json)],
+        )
+
+        exec_info = await asyncio.to_thread(
+            docker_client.api.exec_create,
+            container.id,
+            cmd=[
+                "python",
+                "/usr/local/bin/render_latex.py",
+                "--request",
+                f"{request_dir}/{request_file_name}",
+                "--output-dir",
+                output_dir,
+            ],
+            environment=build_latex_render_exec_environment(timeout),
+            user=f"{SANDBOX_UID}:{SANDBOX_GID}",
+            workdir="/home/sandbox",
+        )
+
+        raw_output, exit_code, timed_out = await run_exec_with_timeout(
+            container=container,
+            container_id=container_id,
+            exec_id=exec_info["Id"],
+            timeout=timeout,
+            execution_id=render_id,
+        )
+
+        if timed_out:
+            raise HTTPException(
+                status_code=504,
+                detail=f"latex render timeout exceeded after {timeout} seconds",
+            )
+
+        try:
+            result_data = parse_latex_render_result(raw_output)
+        except (ExecutorOutputError, TypeError, ValueError) as exc:
+            logger.error("[%s] Failed to parse LaTeX renderer output: %s", render_id, exc)
+            logger.debug("[%s] Raw LaTeX renderer output: %s", render_id, raw_output[:2000] if raw_output else "")
+            raise HTTPException(status_code=500, detail="latex rendering failed") from exc
+
+        if result_data.get("error"):
+            status_code = 400 if exit_code == 2 else 422
+            detail: dict[str, Any] = {
+                "message": str(result_data.get("error") or "latex rendering failed"),
+                "error_type": str(result_data.get("error_type") or "LatexRenderError"),
+            }
+            log_excerpt = result_data.get("log_excerpt")
+            if log_excerpt:
+                detail["log_excerpt"] = str(log_excerpt)
+            raise HTTPException(status_code=status_code, detail=detail)
+
+        output_path = str(result_data.get("output_path") or "")
+        if not output_path:
+            raise HTTPException(status_code=500, detail="latex renderer did not report an output file")
+
+        content = await read_render_output_file(container, path=output_path)
+        if len(content) > LATEX_MAX_OUTPUT_BYTES:
+            raise HTTPException(status_code=500, detail="latex renderer output exceeded size limit")
+
+        file_name = str(result_data.get("file_name") or posixpath.basename(output_path))
+        media_type = str(result_data.get("media_type") or "application/zip")
+        pdf_file_name = str(result_data.get("pdf_file_name") or f"{payload.job_name}.pdf")
+        compiler = str(result_data.get("compiler") or "pdflatex")
+        log_excerpt = str(result_data.get("log_excerpt") or "")
+        execution_time = float(result_data.get("execution_time") or 0)
+
+        return LatexRenderSandboxResult(
+            render_id=render_id,
+            file_name=file_name,
+            content=content,
+            media_type=media_type,
+            pdf_file_name=pdf_file_name,
+            compiler=compiler,
+            log_excerpt=log_excerpt,
+            execution_time=execution_time,
+        )
+    finally:
+        await remove_container(
+            container_id,
+            execution_id=render_id,
+            reason="latex-render-complete",
+            container=container,
         )
 
 
@@ -2638,6 +2990,8 @@ async def build_health_payload() -> tuple[bool, dict]:
         "max_concurrent_renders": RENDER_MAX_CONCURRENT,
         "active_rendering_version": SLIDE_RENDERING_VERSION,
         "render_timeout_seconds": RENDER_TIMEOUT_SECONDS,
+        "latex_render_max_request_body_bytes": LATEX_RENDER_MAX_REQUEST_BODY_SIZE,
+        "latex_render_timeout_seconds": LATEX_RENDER_TIMEOUT_SECONDS,
         "default_timeout": DEFAULT_TIMEOUT,
         "session_timeout_seconds": SESSION_TIMEOUT_SECONDS,
         "max_session_lifetime_seconds": MAX_SESSION_LIFETIME_SECONDS,

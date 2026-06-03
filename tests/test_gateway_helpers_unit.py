@@ -330,6 +330,17 @@ class GatewayParsingAndValidationTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             gateway_app.RenderInputFile(file_name="image.png", base64_content="aGVsbG8=", extra=True)
 
+    def test_latex_input_file_preserves_common_asset_names(self) -> None:
+        for file_name in ["chart 1.png", "figure(2).jpg"]:
+            with self.subTest(file_name=file_name):
+                input_file = gateway_app.LatexInputFile(file_name=file_name, base64_content="aGVsbG8=")
+                self.assertEqual(input_file.file_name, file_name)
+
+        for invalid_name in ["../image.png", "dir/image.png", "dir\\image.png", ".", "..", "bad\nname.png"]:
+            with self.subTest(invalid_name=invalid_name):
+                with self.assertRaises(ValidationError):
+                    gateway_app.LatexInputFile(file_name=invalid_name, base64_content="aGVsbG8=")
+
     def test_validate_render_payload_limits_rejects_oversized_html(self) -> None:
         payload = gateway_app.RenderRequest(html="x" * 5)
         with mock.patch.object(gateway_app, "RENDER_MAX_HTML_CHARS", 4):

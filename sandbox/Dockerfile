@@ -24,6 +24,11 @@ RUN apt-get update && \
         # Node runtime for editable slide rendering
         nodejs \
         npm \
+        # LaTeX runtime for PDF rendering
+        texlive-latex-base \
+        texlive-latex-recommended \
+        texlive-latex-extra \
+        texlive-fonts-recommended \
         # Reaps orphaned child processes for long-lived sandbox sessions
         tini \
     && rm -rf /var/lib/apt/lists/* \
@@ -59,10 +64,11 @@ RUN groupadd -r -g 10001 sandbox && \
 # --- Executor Script ---
 COPY executor.py /usr/local/bin/executor.py
 COPY render_presentation.py /usr/local/bin/render_presentation.py
+COPY render_latex.py /usr/local/bin/render_latex.py
 COPY slide_renderer /opt/code-execution/slide_renderer
 COPY v1 /opt/code-execution/v1
 COPY v2/index.js /opt/code-execution/v2/index.js
-RUN chmod +x /usr/local/bin/executor.py /usr/local/bin/render_presentation.py
+RUN chmod +x /usr/local/bin/executor.py /usr/local/bin/render_presentation.py /usr/local/bin/render_latex.py
 
 # --- Environment ---
 ENV MPLBACKEND=Agg \
