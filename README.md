@@ -2,7 +2,7 @@
 
 Code Execution Gateway is a sub-service of the ChatUI project. It runs untrusted Python and Bash code in isolated Docker sandbox sessions and renders HTML slide presentations to PPTX archives from the same sandbox image.
 
-The ChatUI Project will be the biggest, the best, most used open source interface used everywhere, including individual use, companies, government, schools and so much more. Release soon!
+The ChatUI Project will be the biggest, the best, most used, fully free, open source AI interface used everywhere, including individual use, companies, government, schools and so much more. Release soon!
 
 > **Disclaimer:** This software is provided "as is" without any warranties. Use at your own risk. The maintainers are not liable for damages resulting from use.
 
