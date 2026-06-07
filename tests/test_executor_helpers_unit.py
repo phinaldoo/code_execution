@@ -90,6 +90,10 @@ class ExecutorConfigurationTests(unittest.TestCase):
         self.assertIn("Pip install exception: boom", error or "")
         self.assertIsInstance(install_time, float)
 
+    def test_sandbox_dockerfile_installs_lmodern_for_common_latex_templates(self) -> None:
+        dockerfile = (SANDBOX_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertRegex(dockerfile, r"(?m)^\s*lmodern\s*\\\s*$")
+
 
 class ExecutorResultPayloadTests(unittest.TestCase):
     def test_truncate_output_leaves_short_output_unchanged(self) -> None:

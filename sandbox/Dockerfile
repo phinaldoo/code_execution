@@ -29,6 +29,7 @@ RUN apt-get update && \
         texlive-latex-recommended \
         texlive-latex-extra \
         texlive-fonts-recommended \
+        lmodern \
         # Reaps orphaned child processes for long-lived sandbox sessions
         tini \
     && rm -rf /var/lib/apt/lists/* \

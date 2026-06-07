@@ -563,6 +563,7 @@ Bash execution details:
 - Non-zero exit codes are returned as `BashExitError`.
 
 The sandbox image includes common packages for data analysis, visualization, browser automation, document handling, presentation rendering, and file formats, including NumPy, pandas, SciPy, Matplotlib, seaborn, scikit-learn, SymPy, requests, Playwright, openpyxl, PyYAML, reportlab, python-pptx, python-docx, Node.js, and PptxGenJS.
+It also includes a minimal LaTeX stack with `pdflatex` and Latin Modern support (`lmodern`) so common document templates can compile without extra image customization.
 
 Sandbox containers use a read-only root filesystem by default. Writable state is limited to bounded tmpfs mounts, primarily `/home/sandbox` for per-session files and `/tmp` for execution scratch space, output collection, and library caches.
 
