@@ -84,6 +84,42 @@ class LatexRenderCliTests(unittest.TestCase):
                 self.assertTrue(archive.read("source/main.tex").decode("utf-8").startswith("\\documentclass"))
                 self.assertEqual(archive.read("logs/pdflatex.log").decode("utf-8"), "mock compile log")
 
+    def test_render_from_file_writes_input_assets_before_compilation(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            asset_bytes = b"fake-image-bytes"
+            request_path = tmp_path / "request.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "tex": "\\documentclass{article}\\usepackage{graphicx}\\begin{document}\\includegraphics{chart 1.png}\\end{document}",
+                        "job_name": "asset-check",
+                        "input_files": [
+                            {
+                                "file_name": "chart 1.png",
+                                "base64_content": "ZmFrZS1pbWFnZS1ieXRlcw==",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_run_pdflatex(work_dir, tex_path):
+                self.assertEqual(tex_path.name, "main.tex")
+                self.assertEqual((work_dir / "chart 1.png").read_bytes(), asset_bytes)
+                (work_dir / "main.pdf").write_bytes(b"%PDF-1.4\nmock pdf\n")
+                (work_dir / "main.log").write_text("mock compile log", encoding="utf-8")
+                return "stdout log", 0.12
+
+            with mock.patch.object(module, "run_pdflatex", fake_run_pdflatex):
+                result = module.render_from_file(request_path, tmp_path / "out")
+
+            self.assertEqual(result["pdf_file_name"], "asset-check.pdf")
+            self.assertTrue(Path(result["output_path"]).exists())
+
     def test_render_from_file_preserves_compile_error_log(self):
         module = load_module()
 

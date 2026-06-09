@@ -392,6 +392,7 @@ class LocalStaticServerTests(unittest.TestCase):
                         self.assertEqual(server.base_url, "http://127.0.0.1:43210")
                         self.assertTrue(fake_server.daemon_threads)
                         self.assertEqual(fake_server.request_queue_size, 16)
+                        self.assertEqual(server_cls.call_args.args[1].keywords["directory"], str(root))
                         fake_thread.start.assert_called_once_with()
 
             server_cls.assert_called_once()

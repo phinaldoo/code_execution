@@ -27,12 +27,14 @@ from state import InMemoryStateBackend, SessionInfo
 
 
 class GatewayPrimitiveHelperTests(unittest.TestCase):
-    def test_str_to_bool_uses_default_only_for_missing_values(self) -> None:
+    def test_str_to_bool_uses_default_for_missing_or_blank_values(self) -> None:
         self.assertTrue(gateway_app.str_to_bool(None, default=True))
         self.assertFalse(gateway_app.str_to_bool(None, default=False))
+        self.assertTrue(gateway_app.str_to_bool("", default=True))
+        self.assertFalse(gateway_app.str_to_bool("  ", default=False))
         for value in ("1", "true", "TRUE", " yes ", "on"):
             self.assertTrue(gateway_app.str_to_bool(value, default=False))
-        for value in ("0", "false", "no", "off", "unexpected", ""):
+        for value in ("0", "false", "no", "off", "unexpected"):
             self.assertFalse(gateway_app.str_to_bool(value, default=True))
 
     def test_split_csv_strips_empty_items(self) -> None:
@@ -417,9 +419,16 @@ class GatewayFilePreparationTests(unittest.TestCase):
 
         self.assertEqual(env["BETA"], "1")
         self.assertEqual(env["SLIDE_RENDERING_VERSION"], "v2")
+        self.assertEqual(env["ALLOWED_HOSTS"], "127.0.0.1,localhost")
         self.assertEqual(env["RENDER_TIMEOUT_SECONDS"], "77")
         self.assertEqual(env["MAX_CONCURRENT_RENDERS"], "1")
         self.assertEqual(env["PLAYWRIGHT_BROWSERS_PATH"], "/ms-playwright")
+
+    def test_build_render_exec_environment_can_forward_insecure_override(self) -> None:
+        with mock.patch.object(gateway_app, "RENDER_ALLOW_INSECURE_PRODUCTION_CONFIGURATION", "true"):
+            env = gateway_app.build_render_exec_environment(77)
+
+        self.assertEqual(env["ALLOW_INSECURE_PRODUCTION_CONFIGURATION"], "true")
 
 
 class GatewayAsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
@@ -438,6 +447,22 @@ class GatewayAsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await gateway_app.enforce_rate_limit("bucket", limit=1, window_seconds=60, message="slow down")
         self.assertEqual(ctx.exception.status_code, 429)
         self.assertEqual(ctx.exception.detail, "slow down")
+
+    async def test_provision_files_uses_isolated_python_startup(self) -> None:
+        exec_create = mock.Mock(return_value={"Id": "exec-1"})
+        gateway_app.docker_client = SimpleNamespace(api=SimpleNamespace(exec_create=exec_create))
+        fake_container = SimpleNamespace(id="ctr-1")
+
+        with mock.patch.object(gateway_app, "_run_exec_with_stdin", return_value=(b"", b"", 0)):
+            await gateway_app.provision_files_in_container(
+                fake_container,
+                target_dir="/home/sandbox",
+                files=[gateway_app.PreparedFile("input.txt", b"hello")],
+            )
+
+        kwargs = exec_create.call_args.kwargs
+        self.assertEqual(kwargs["cmd"][:4], ["python", "-I", "-S", "-c"])
+        self.assertEqual(kwargs["workdir"], "/tmp")
 
     async def test_enforce_container_creation_limits_allows_under_both_limits(self) -> None:
         await self.backend.save_session(

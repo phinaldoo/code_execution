@@ -406,6 +406,30 @@ class GatewaySafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("presentation_v2_test.zip", response.headers["content-disposition"])
         render_mock.assert_awaited_once()
 
+    async def test_latex_endpoint_applies_throttles_before_decoding_assets(self) -> None:
+        gateway_app.render_semaphore = asyncio.Semaphore(1)
+        payload = gateway_app.LatexRenderRequest(
+            tex="hello",
+            input_files=[
+                gateway_app.LatexInputFile(
+                    file_name="asset.bin",
+                    base64_content="not base64",
+                )
+            ],
+        )
+        auth = gateway_app.AuthContext(subject="subject-1", tenant=None, auth_type="api_key")
+
+        with mock.patch.object(
+            gateway_app,
+            "enforce_rate_limit",
+            mock.AsyncMock(side_effect=HTTPException(status_code=429, detail="slow down")),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await gateway_app.latex_render_endpoint(payload, auth)
+
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.detail, "slow down")
+
     async def test_create_render_container_uses_render_resource_limits(self) -> None:
         auth = gateway_app.AuthContext(subject="subject-1", tenant=None, auth_type="api_key")
 
@@ -677,6 +701,7 @@ class GatewayVersionTests(unittest.IsolatedAsyncioTestCase):
                 "version": gateway_app.APP_VERSION_TAG,
                 "execute_endpoint": "/execute",
                 "render_endpoint": "/api/render",
+                "latex_render_endpoint": "/api/latex/render",
                 "version_endpoint": "/version",
             },
         )
@@ -802,6 +827,10 @@ class RequestLimitAndMetricsTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(gateway_app.request_content_length_exceeds_limit(missing))
 
     def test_render_path_uses_render_body_limit(self) -> None:
+        self.assertLess(
+            gateway_app.LATEX_RENDER_MAX_REQUEST_BODY_SIZE,
+            gateway_app.RENDER_MAX_REQUEST_BODY_SIZE,
+        )
         self.assertEqual(
             gateway_app.request_body_limit_for_path("/api/render"),
             gateway_app.RENDER_MAX_REQUEST_BODY_SIZE,

@@ -42,8 +42,8 @@ from version import APP_VERSION, APP_VERSION_TAG, get_version_payload
 
 
 def str_to_bool(value: Optional[str], default: bool = True) -> bool:
-    """Convert a string value to boolean, using default if value is None."""
-    if value is None:
+    """Convert a string value to boolean, using default if value is missing or blank."""
+    if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -112,12 +112,12 @@ SANDBOX_PIDS_LIMIT = int(os.getenv("SANDBOX_PIDS_LIMIT", "256"))
 SANDBOX_TMP_ROOT_SIZE = os.getenv("SANDBOX_TMP_ROOT_SIZE", "512m")
 SANDBOX_SHM_SIZE = os.getenv("SANDBOX_SHM_SIZE", "128m")
 SANDBOX_HOME_TMPFS_SIZE = os.getenv("SANDBOX_HOME_TMPFS_SIZE", "256m")
-SANDBOX_READ_ONLY_ROOTFS = str_to_bool(os.getenv("SANDBOX_READ_ONLY_ROOTFS", "true"))
+SANDBOX_READ_ONLY_ROOTFS = str_to_bool(os.getenv("SANDBOX_READ_ONLY_ROOTFS"), default=True)
 SANDBOX_NETWORK_MODE = os.getenv("SANDBOX_NETWORK_MODE", "none")
 SANDBOX_UID = int(os.getenv("SANDBOX_UID", "10001"))
 SANDBOX_GID = int(os.getenv("SANDBOX_GID", "10001"))
 SANDBOX_USER = os.getenv("SANDBOX_USER", "sandbox")
-USE_DOCKER_DEFAULT_SECCOMP = str_to_bool(os.getenv("USE_DOCKER_DEFAULT_SECCOMP", "true"))
+USE_DOCKER_DEFAULT_SECCOMP = str_to_bool(os.getenv("USE_DOCKER_DEFAULT_SECCOMP"), default=True)
 SECCOMP_PROFILE_DAEMON_PATH = (
     os.getenv("SECCOMP_PROFILE_DAEMON_PATH")
     or os.getenv("SECCOMP_PROFILE_PATH")
@@ -125,9 +125,9 @@ SECCOMP_PROFILE_DAEMON_PATH = (
 ).strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DOCKER_HOST = os.getenv("DOCKER_HOST", "").strip()
-ENABLE_DOCS = str_to_bool(os.getenv("ENABLE_DOCS", "false"))
+ENABLE_DOCS = str_to_bool(os.getenv("ENABLE_DOCS"), default=False)
 
-ENABLE_CORS = str_to_bool(os.getenv("ENABLE_CORS", "true"))
+ENABLE_CORS = str_to_bool(os.getenv("ENABLE_CORS"), default=True)
 CORS_ALLOW_ORIGINS = split_csv(os.getenv("CORS_ALLOW_ORIGINS"))
 CORS_ALLOW_METHODS = split_csv(os.getenv("CORS_ALLOW_METHODS")) or ["GET", "POST", "DELETE", "OPTIONS"]
 CORS_ALLOW_HEADERS = split_csv(os.getenv("CORS_ALLOW_HEADERS")) or [
@@ -136,7 +136,7 @@ CORS_ALLOW_HEADERS = split_csv(os.getenv("CORS_ALLOW_HEADERS")) or [
     "X-Request-ID",
     "X-API-Key",
 ]
-CORS_ALLOW_CREDENTIALS = str_to_bool(os.getenv("CORS_ALLOW_CREDENTIALS", "true"), default=True)
+CORS_ALLOW_CREDENTIALS = str_to_bool(os.getenv("CORS_ALLOW_CREDENTIALS"), default=True)
 
 REQUIRE_AUTH = str_to_bool(os.getenv("REQUIRE_AUTH"), default=IS_PRODUCTION)
 METRICS_AUTH_REQUIRED = str_to_bool(
@@ -158,7 +158,7 @@ MAX_REQUEST_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_SIZE", str(32 * 1024 * 1
 MAX_FILE_NAME_LENGTH = int(os.getenv("MAX_FILE_NAME_LENGTH", "128"))
 MAX_PIP_PACKAGES = int(os.getenv("MAX_PIP_PACKAGES", "5"))
 MAX_PIP_PACKAGE_NAME_LENGTH = int(os.getenv("MAX_PIP_PACKAGE_NAME_LENGTH", "64"))
-ALLOW_PIP_INSTALLS = str_to_bool(os.getenv("ALLOW_PIP_INSTALLS", "false"))
+ALLOW_PIP_INSTALLS = str_to_bool(os.getenv("ALLOW_PIP_INSTALLS"), default=False)
 PIP_PACKAGE_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*([\[,\]A-Za-z0-9._-]*)?"
     r"(([!=<>~]=?|>=?|<=?)[\w.*]+([,;]([!=<>~]=?|>=?|<=?)[\w.*]+)*)?$"
@@ -217,12 +217,18 @@ LATEX_MAX_TOTAL_ASSET_BYTES = int_from_env("LATEX_MAX_TOTAL_ASSET_BYTES", 25_000
 LATEX_MAX_OUTPUT_BYTES = int_from_env("LATEX_MAX_OUTPUT_BYTES", 25_000_000, min_value=1_024)
 LATEX_RENDER_MAX_REQUEST_BODY_SIZE = int_from_env(
     ("LATEX_RENDER_MAX_REQUEST_BODY_BYTES", "MAX_LATEX_RENDER_REQUEST_BODY_BYTES"),
-    max(
-        RENDER_MAX_REQUEST_BODY_SIZE,
-        ((LATEX_MAX_TOTAL_ASSET_BYTES + 2) // 3) * 4 + LATEX_MAX_TEX_CHARS + 1_000_000,
-    ),
+    ((LATEX_MAX_TOTAL_ASSET_BYTES + 2) // 3) * 4 + LATEX_MAX_TEX_CHARS + 1_000_000,
     min_value=1_024,
 )
+RENDER_ALLOWED_HOSTS = (
+    os.getenv("RENDER_ALLOWED_HOSTS")
+    or os.getenv("ALLOWED_HOSTS")
+    or "127.0.0.1,localhost"
+)
+RENDER_ALLOW_INSECURE_PRODUCTION_CONFIGURATION = os.getenv(
+    "RENDER_ALLOW_INSECURE_PRODUCTION_CONFIGURATION",
+    os.getenv("ALLOW_INSECURE_PRODUCTION_CONFIGURATION", ""),
+).strip()
 RENDER_PAGE_LOAD_TIMEOUT_MS = int_from_env("PAGE_LOAD_TIMEOUT_MS", 30_000, min_value=1_000)
 RENDER_RATE_LIMIT_REQUESTS = int_from_env(
     "RENDER_RATE_LIMIT_REQUESTS_PER_WINDOW",
@@ -251,7 +257,7 @@ CONTAINER_RATE_LIMIT_WINDOW_SECONDS = int(
 MAX_CONTAINERS_PER_PRINCIPAL = int(os.getenv("MAX_CONTAINERS_PER_PRINCIPAL", "3"))
 MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "100"))
 CONTAINER_CREATE_GUARD_TIMEOUT = int(os.getenv("CONTAINER_CREATE_GUARD_TIMEOUT", "30"))
-ALLOW_SANDBOX_ENV_INJECTION = str_to_bool(os.getenv("ALLOW_SANDBOX_ENV_INJECTION", "false"))
+ALLOW_SANDBOX_ENV_INJECTION = str_to_bool(os.getenv("ALLOW_SANDBOX_ENV_INJECTION"), default=False)
 REQUIRE_SHARED_STATE = str_to_bool(os.getenv("REQUIRE_SHARED_STATE"), default=IS_PRODUCTION)
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
@@ -1646,7 +1652,6 @@ async def render_endpoint(
     start = time.monotonic()
 
     try:
-        validate_render_payload_limits(payload)
         try:
             await asyncio.wait_for(
                 render_semaphore.acquire(),
@@ -1672,6 +1677,8 @@ async def render_endpoint(
             window_seconds=CONTAINER_RATE_LIMIT_WINDOW_SECONDS,
             message="Container creation rate limit exceeded for this principal.",
         )
+
+        validate_render_payload_limits(payload)
 
         try:
             result = await render_presentation_in_sandbox(
@@ -1744,7 +1751,6 @@ async def latex_render_endpoint(
     start = time.monotonic()
 
     try:
-        validate_latex_payload_limits(payload)
         try:
             await asyncio.wait_for(
                 render_semaphore.acquire(),
@@ -1770,6 +1776,8 @@ async def latex_render_endpoint(
             window_seconds=CONTAINER_RATE_LIMIT_WINDOW_SECONDS,
             message="Container creation rate limit exceeded for this principal.",
         )
+
+        validate_latex_payload_limits(payload)
 
         try:
             result = await render_latex_in_sandbox(
@@ -2000,13 +2008,13 @@ async def provision_files_in_container(
     exec_info = await asyncio.to_thread(
         docker_client.api.exec_create,
         container.id,
-        cmd=["python", "-c", FILE_PROVISION_SCRIPT],
+        cmd=["python", "-I", "-S", "-c", FILE_PROVISION_SCRIPT],
         stdin=True,
         stdout=True,
         stderr=True,
         environment={"TARGET_DIR": target_dir},
         user=f"{SANDBOX_UID}:{SANDBOX_GID}",
-        workdir="/home/sandbox",
+        workdir="/tmp",
     )
 
     try:
@@ -2508,11 +2516,12 @@ async def run_code_in_sandbox(
 
 def build_render_exec_environment(timeout: int) -> dict[str, str]:
     """Build environment variables for the sandbox render CLI."""
-    return {
+    env = {
         "APP_ENV": APP_ENV,
         "BETA": "1" if SLIDE_RENDERING_VERSION == "v2" else "0",
         "SLIDE_RENDERING_VERSION": SLIDE_RENDERING_VERSION,
         "RENDERING_VERSION": SLIDE_RENDERING_VERSION,
+        "ALLOWED_HOSTS": RENDER_ALLOWED_HOSTS,
         "RENDER_TIMEOUT_SECONDS": str(timeout),
         "RENDER_QUEUE_TIMEOUT_MS": str(RENDER_QUEUE_TIMEOUT_MS),
         "PAGE_LOAD_TIMEOUT_MS": str(RENDER_PAGE_LOAD_TIMEOUT_MS),
@@ -2534,6 +2543,11 @@ def build_render_exec_environment(timeout: int) -> dict[str, str]:
         "XDG_CACHE_HOME": "/tmp/.cache",  # nosec
         "PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright",
     }
+    if RENDER_ALLOW_INSECURE_PRODUCTION_CONFIGURATION:
+        env["ALLOW_INSECURE_PRODUCTION_CONFIGURATION"] = (
+            RENDER_ALLOW_INSECURE_PRODUCTION_CONFIGURATION
+        )
+    return env
 
 
 def build_latex_render_exec_environment(timeout: int) -> dict[str, str]:
