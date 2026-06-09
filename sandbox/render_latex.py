@@ -180,8 +180,8 @@ def _read_log(work_dir: Path, fallback: str) -> str:
     if log_path.exists():
         try:
             return log_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+        except OSError:
+            return fallback
     return fallback
 
 
@@ -279,8 +279,8 @@ def main() -> int:
         try:
             if not log_excerpt:
                 log_excerpt = (Path(args.output_dir) / "work" / "main.log").read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+        except OSError:
+            log_excerpt = ""
         emit_result(
             build_error_payload(
                 str(exc),
