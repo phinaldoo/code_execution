@@ -833,6 +833,14 @@ def session_idle_expired(session: SessionInfo, *, now: Optional[float] = None) -
     return (now or time.time()) - session.last_activity > SESSION_TIMEOUT_SECONDS
 
 
+def session_is_active(session: SessionInfo, *, now: Optional[float] = None) -> bool:
+    """Return whether a session is still within its active window."""
+    current_time = now or time.time()
+    return not session_idle_expired(session, now=current_time) and not session_hard_expired(
+        session, now=current_time
+    )
+
+
 def enforce_session_daemon_affinity(session: SessionInfo) -> None:
     """Raise HTTPException if session belongs to a different Docker daemon."""
     if session_is_local(session):
@@ -982,11 +990,17 @@ async def enforce_rate_limit(
 
 async def enforce_container_creation_limits(auth: AuthContext) -> None:
     """Enforce limits on total containers and containers per principal."""
+    now = time.time()
     sessions = await state_backend.list_sessions()
-    total_sessions = len(sessions)
+    active_sessions = {
+        container_id: session
+        for container_id, session in sessions.items()
+        if session_is_active(session, now=now)
+    }
+    total_sessions = len(active_sessions)
     owner_sessions = sum(
         1
-        for session in sessions.values()
+        for session in active_sessions.values()
         if session.owner_subject == auth.subject and session.owner_tenant == auth.tenant
     )
 
@@ -1064,8 +1078,7 @@ async def cleanup_idle_containers() -> None:
             idle_ids = [
                 cid
                 for cid, session in sessions.items()
-                if session_is_local(session)
-                and (session_idle_expired(session, now=now) or session_hard_expired(session, now=now))
+                if session_is_local(session) and not session_is_active(session, now=now)
             ]
 
             for cid in idle_ids:

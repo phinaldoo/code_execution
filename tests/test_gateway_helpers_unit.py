@@ -173,6 +173,27 @@ class GatewaySessionHelperTests(unittest.TestCase):
             self.assertFalse(gateway_app.session_idle_expired(self._session(last_activity=70.0), now=100.0))
             self.assertTrue(gateway_app.session_idle_expired(self._session(last_activity=69.0), now=100.0))
 
+    def test_session_is_active_rejects_idle_or_hard_expired_sessions(self) -> None:
+        with mock.patch.object(gateway_app, "SESSION_TIMEOUT_SECONDS", 30):
+            self.assertTrue(
+                gateway_app.session_is_active(
+                    self._session(last_activity=80.0, expires_at=150.0),
+                    now=100.0,
+                )
+            )
+            self.assertFalse(
+                gateway_app.session_is_active(
+                    self._session(last_activity=69.0, expires_at=150.0),
+                    now=100.0,
+                )
+            )
+            self.assertFalse(
+                gateway_app.session_is_active(
+                    self._session(last_activity=80.0, expires_at=99.0),
+                    now=100.0,
+                )
+            )
+
     def test_enforce_session_daemon_affinity_rejects_remote_sessions(self) -> None:
         with mock.patch.object(gateway_app, "local_docker_daemon_id", "daemon-local"):
             with self.assertRaises(HTTPException) as ctx:
@@ -467,14 +488,15 @@ class GatewayAsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_enforce_container_creation_limits_allows_under_both_limits(self) -> None:
         await self.backend.save_session(
             "ctr-existing",
-            SessionInfo(1.0, 1.0, False, "other", None),
+            SessionInfo(1.0, 90.0, False, "other", None, expires_at=1000.0),
             session_timeout_seconds=60,
         )
         with mock.patch.object(gateway_app, "MAX_ACTIVE_SESSIONS", 2), mock.patch.object(
             gateway_app,
             "MAX_CONTAINERS_PER_PRINCIPAL",
             1,
-        ):
+        ), mock.patch.object(gateway_app, "time", wraps=gateway_app.time) as mocked_time:
+            mocked_time.time.return_value = 100.0
             await gateway_app.enforce_container_creation_limits(
                 gateway_app.AuthContext("subject-1", None, "api_key")
             )
@@ -482,10 +504,15 @@ class GatewayAsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_enforce_container_creation_limits_rejects_total_limit(self) -> None:
         await self.backend.save_session(
             "ctr-existing",
-            SessionInfo(1.0, 1.0, False, "other", None),
+            SessionInfo(1.0, 90.0, False, "other", None, expires_at=1000.0),
             session_timeout_seconds=60,
         )
-        with mock.patch.object(gateway_app, "MAX_ACTIVE_SESSIONS", 1):
+        with mock.patch.object(gateway_app, "MAX_ACTIVE_SESSIONS", 1), mock.patch.object(
+            gateway_app,
+            "time",
+            wraps=gateway_app.time,
+        ) as mocked_time:
+            mocked_time.time.return_value = 100.0
             with self.assertRaises(HTTPException) as ctx:
                 await gateway_app.enforce_container_creation_limits(
                     gateway_app.AuthContext("subject-1", None, "api_key")
@@ -495,19 +522,39 @@ class GatewayAsyncBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_enforce_container_creation_limits_rejects_owner_limit(self) -> None:
         await self.backend.save_session(
             "ctr-existing",
-            SessionInfo(1.0, 1.0, False, "subject-1", "tenant-1"),
+            SessionInfo(1.0, 90.0, False, "subject-1", "tenant-1", expires_at=1000.0),
             session_timeout_seconds=60,
         )
         with mock.patch.object(gateway_app, "MAX_ACTIVE_SESSIONS", 10), mock.patch.object(
             gateway_app,
             "MAX_CONTAINERS_PER_PRINCIPAL",
             1,
-        ):
+        ), mock.patch.object(gateway_app, "time", wraps=gateway_app.time) as mocked_time:
+            mocked_time.time.return_value = 100.0
             with self.assertRaises(HTTPException) as ctx:
                 await gateway_app.enforce_container_creation_limits(
                     gateway_app.AuthContext("subject-1", "tenant-1", "jwt")
                 )
         self.assertEqual(ctx.exception.status_code, 429)
+
+    async def test_enforce_container_creation_limits_ignores_expired_sessions(self) -> None:
+        await self.backend.save_session(
+            "ctr-expired",
+            SessionInfo(1.0, 1.0, False, "subject-1", "tenant-1", expires_at=2.0),
+            session_timeout_seconds=60,
+        )
+        with mock.patch.object(gateway_app, "MAX_ACTIVE_SESSIONS", 10), mock.patch.object(
+            gateway_app,
+            "MAX_CONTAINERS_PER_PRINCIPAL",
+            1,
+        ), mock.patch.object(gateway_app, "SESSION_TIMEOUT_SECONDS", 30), mock.patch.object(
+            gateway_app.time,
+            "time",
+            return_value=100.0,
+        ):
+            await gateway_app.enforce_container_creation_limits(
+                gateway_app.AuthContext("subject-1", "tenant-1", "jwt")
+            )
 
     async def test_touch_session_delegates_timeout_to_state_backend(self) -> None:
         session = SessionInfo(1.0, 1.0, False, "subject", None)
