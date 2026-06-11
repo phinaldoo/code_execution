@@ -776,6 +776,15 @@ def verify_auth(
     return authenticate_credentials(credentials, required=REQUIRE_AUTH)
 
 
+def verify_health_auth(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> AuthContext:
+    """Authenticate health checks whenever gateway credentials are configured."""
+    if JWT_SECRET or STATIC_API_KEYS or REQUIRE_AUTH:
+        return authenticate_credentials(credentials, required=True)
+    return AuthContext(subject="anonymous", tenant=None, auth_type="none")
+
+
 async def verify_render_auth(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -3031,7 +3040,7 @@ async def build_health_payload() -> tuple[bool, dict]:
 @app.get("/health")
 @app.get("/healthz")
 @app.get("/readyz")
-async def health_check():
+async def health_check(_auth: AuthContext = Depends(verify_health_auth)):
     """Simple health check endpoint returning service status."""
     healthy, payload = await build_health_payload()
     return JSONResponse(
@@ -3042,7 +3051,7 @@ async def health_check():
 
 @app.get("/health/details")
 @app.get("/healthz/details")
-async def health_check_details(_auth: AuthContext = Depends(verify_auth)):
+async def health_check_details(_auth: AuthContext = Depends(verify_health_auth)):
     """Detailed health check endpoint returning full service status."""
     healthy, payload = await build_health_payload()
     return JSONResponse(

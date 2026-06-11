@@ -135,7 +135,7 @@ make up
 The service is available at:
 
 - `http://localhost:8000`
-- `http://localhost:8000/healthz`
+- `http://localhost:8000/healthz` (use `Authorization: Bearer <api_key>`)
 - `http://localhost:8000/version`
 
 Useful Makefile commands:
@@ -298,7 +298,8 @@ Check the service:
 ```bash
 curl -sS http://localhost:8000/
 curl -sS http://localhost:8000/version
-curl -sS http://localhost:8000/healthz
+curl -sS http://localhost:8000/healthz \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 Create a sandbox session:
@@ -384,9 +385,9 @@ Invoke-RestMethod -Method Delete -Uri "http://localhost:8000/containers/$($Conta
 
 - `GET /` - service metadata.
 - `GET /version` - release and execution contract metadata.
-- `GET /health` and `GET /healthz` - lightweight health, unauthenticated.
-- `GET /livez` and `GET /readyz` - renderer-compatible health aliases.
-- `GET /health/details` and `GET /healthz/details` - detailed health, authenticated when `REQUIRE_AUTH=true`.
+- `GET /health` and `GET /healthz` - lightweight health, authenticated with the configured Bearer token.
+- `GET /livez` and `GET /readyz` - renderer-compatible health aliases that use the same auth.
+- `GET /health/details` and `GET /healthz/details` - detailed health, authenticated with the configured Bearer token.
 - `GET /metrics` - Prometheus metrics, protected by `METRICS_AUTH_REQUIRED`.
 - `GET /metrics/json` - JSON debug counters, authenticated when `REQUIRE_AUTH=true`.
 - `POST /containers` - create a sandbox session.
@@ -796,7 +797,7 @@ Version metadata:
 GET /version
 ```
 
-Unauthenticated lightweight health:
+Authenticated lightweight health:
 
 ```text
 GET /health

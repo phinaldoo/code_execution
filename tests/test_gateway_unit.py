@@ -13,6 +13,7 @@ from unittest import mock
 
 import docker.errors
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 
@@ -483,6 +484,21 @@ class GatewayConfigurationTests(unittest.TestCase):
         }
         overrides.update(extra)
         return overrides
+
+    def test_health_routes_require_auth_dependency(self) -> None:
+        routes = {
+            route.path: route
+            for route in gateway_app.app.routes
+            if isinstance(route, APIRoute) and "GET" in route.methods
+        }
+
+        for path in ("/health", "/healthz", "/readyz"):
+            with self.subTest(path=path):
+                dependant = routes[path].dependant
+                self.assertTrue(
+                    any(dep.call is gateway_app.verify_health_auth for dep in dependant.dependencies),
+                    f"{path} must require verify_health_auth",
+                )
 
     def test_validate_runtime_configuration_rejects_short_hmac_jwt_secret_in_production(self) -> None:
         overrides = self._base_overrides(
